@@ -239,7 +239,10 @@ std::string make_gguf(const std::string& dir, const std::string& name, const Spe
   }
   if (s.rope_freqs) {
     std::string d;
-    for (int64_t i = 0; i < s.head_dim / 2; ++i) put_f32(d, i < s.rope_nz ? 1.0f : 0.0f);
+    for (int64_t i = 0; i < s.head_dim / 2; ++i) {
+      if (s.rope_nz < 0) put_f32(d, i < s.head_dim / 4 ? 1.0f : 1e30f);  // llama.cpp's exponent mask
+      else put_f32(d, i < s.rope_nz ? 1.0f : 0.0f);                      // a plain zero-tail table
+    }
     ts.push_back({"rope_freqs.weight", {uint64_t(s.head_dim / 2)}, 0, d});
   }
 
@@ -399,6 +402,18 @@ int main() {
   }
 
   // the partial rotation from the baked zero-tail table, and Lfm3Config's default without it
+  {
+    Spec s;
+    s.rope_nz = -1;  // llama.cpp's exponent mask: 1 rotates, 1e30 marks the unrotated tail
+    const std::string g = make_gguf(base, "lfm3-mask", s);
+    const ImportOptions p{.file = g, .name = "lfm3-mask", .plan_dir = base + "/plan4", .progress = false,
+                          .drafter = false};
+    err = first_error(g, p);
+    const double prf = err.empty() ? read_json(base + "/plan4/config.json")["rope_parameters"]["full_attention"]
+                                         .value("partial_rotary_factor", 0.0)
+                                   : 0.0;
+    ok("llama.cpp's 1/1e30 exponent mask: 0.5", err.empty() && prf == 0.5, err);
+  }
   {
     Spec s;
     s.rope_freqs = false;
