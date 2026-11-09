@@ -35,6 +35,10 @@ struct Lfm3ConvParams {
 struct Lfm3GateParams {
   uint32_t T, Hq, D;
 };
+struct Lfm3AttnParams {
+  uint32_t Hq, Hkv, D, cap, pos, window;
+  float scale;
+};
 
 uint32_t lcg(uint32_t& s) { return s = s * 1664525u + 1013904223u; }
 
@@ -207,6 +211,83 @@ int main(int argc, char** argv) {
           }
         }
       ok("gate pack: q beside the broadcast gate", good);
+    }
+  }
+
+  // decode attention at head dim 128: GQA 4:1 and 1:1, full and sliding, first/middle/late positions,
+  // against a double-precision reference of the same math
+  {
+    const uint32_t D = 128;
+    const float scale = 1.f / std::sqrt(float(D));
+    for (auto [Hq, Hkv] : {std::pair{4u, 1u}, {4u, 4u}}) {
+      const uint32_t cap = 64;
+      uint32_t seed = 777 + Hq;
+      std::vector<float> q(size_t(Hq * D)), gate(size_t(Hq), 0.f), out(size_t(Hq * D), 0.f),
+          want(size_t(Hq * D));
+      std::vector<_Float16> kc(size_t(Hkv * cap * D)), vc(size_t(Hkv * cap * D));
+      for (auto& x : q) x = rnd(seed);
+      for (auto& x : gate) x = rnd(seed);
+      for (auto& x : kc) x = _Float16(rnd(seed) / 4.f);
+      for (auto& x : vc) x = _Float16(rnd(seed) / 4.f);
+      ni::Buffer bq = gpu.alloc(q.size() * 4, "aq"), bkc = gpu.alloc(kc.size() * 2, "akc"),
+                 bvc = gpu.alloc(vc.size() * 2, "avc"), bg = gpu.alloc(gate.size() * 4, "agate"),
+                 bo = gpu.alloc(out.size() * 4, "aout");
+      memcpy(bq.ptr(), q.data(), q.size() * 4);
+      memcpy(bkc.ptr(), kc.data(), kc.size() * 2);
+      memcpy(bvc.ptr(), vc.data(), vc.size() * 2);
+      memcpy(bg.ptr(), gate.data(), gate.size() * 4);
+      for (const uint32_t window : {0u, 8u}) {
+        for (const uint32_t pos : {0u, 17u, 55u, 63u}) {
+          Lfm3AttnParams p{Hq, Hkv, D, cap, pos, window, scale};
+          auto e = gpu.begin();
+          e->use(gpu.pipeline("lfm3_attn_d"));
+          e->buf(0, bq);
+          e->buf(1, bkc);
+          e->buf(2, bvc);
+          e->buf(3, bg);
+          e->buf(4, bo);
+          e->val(5, p);
+          e->dispatch(Hq, 1, 1, 1);
+          e->commit_and_wait();
+          // the reference
+          const uint32_t beg = window && pos >= window ? pos + 1 - window : 0;
+          for (uint32_t h = 0; h < Hq; ++h) {
+            const _Float16* kkh = kc.data() + uint64_t(h / (Hq / Hkv)) * cap * D;
+            const _Float16* vvh = vc.data() + uint64_t(h / (Hq / Hkv)) * cap * D;
+            double m = -1e300;
+            std::vector<double> sc(size_t(pos - beg + 1));
+            for (uint32_t t = beg; t <= pos; ++t) {
+              double acc = 0;
+              for (uint32_t d = 0; d < D; ++d)
+                acc += double(q[size_t(h) * D + d]) * double(kkh[uint64_t(t) * D + d]);
+              sc[size_t(t - beg)] = acc * scale;
+              m = std::max(m, sc[size_t(t - beg)]);
+            }
+            double denom = 0;
+            for (double s : sc) denom += std::exp(s - m);
+            for (uint32_t d = 0; d < D; ++d) {
+              double acc = 0;
+              for (uint32_t t = beg; t <= pos; ++t)
+                acc += std::exp(sc[size_t(t - beg)] - m) / denom * double(vvh[uint64_t(t) * D + d]);
+              want[size_t(h) * D + d] = float(acc * (1.0 / (1.0 + std::exp(-double(gate[h])))));
+            }
+          }
+          memcpy(out.data(), bo.as<float>(), out.size() * 4);
+          bool good = true;
+          for (size_t i = 0; i < want.size(); ++i)
+            if (fabsf(out[i] - want[i]) > 2e-4f * (1.f + fabsf(want[i]))) {
+              good = false;
+              if (g_fail == 0)
+                fprintf(stderr, "  first diff at %zu: %g vs %g (Hq %u/%u, w %u, pos %u)\n", i, out[i], want[i],
+                        Hq, Hkv, window, pos);
+              break;
+            }
+          ok((std::string("attn ") + std::to_string(Hq) + "/" + std::to_string(Hkv) + " w" +
+              std::to_string(window) + " pos" + std::to_string(pos))
+                 .c_str(),
+             good);
+        }
+      }
     }
   }
 
