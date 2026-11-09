@@ -47,6 +47,56 @@ struct Lfm3ConvParams {
   ring_out[(p.K - 2) * p.H + c] = bfloat(u[c]);  // the newest frame
 }
 
+struct Lfm3AttnParams {
+  uint Hq;     // query heads
+  uint Hkv;    // key/value heads
+  uint D;      // head dim (128)
+  uint cap;    // the caches' row stride (positions)
+  uint pos;    // this row's position
+  uint window; // the sliding window (0: every position)
+  float scale; // 1 / sqrt(D)
+};
+
+// Plain decode attention at head dim 128, one thread per query head (correctness first; the split-K forms
+// come with the engine's measured shapes). q is one row, normed and roped; the caches hold fp16 rows
+// [Hkv, cap, D]; the softmax runs over the causal positions, the last `window` of them on a sliding layer.
+// The per-head sigmoid gate multiplies the head's output before it returns.
+[[kernel]] void lfm3_attn_d(const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]],
+                            const device half* vc [[buffer(2)]], const device float* gate [[buffer(3)]],
+                            device float* out [[buffer(4)]], constant Lfm3AttnParams& p [[buffer(5)]],
+                            uint gid [[thread_position_in_grid]]) {
+  const uint h = gid;
+  if (h >= p.Hq) return;
+  const device half* kkh = kc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
+  const device half* vvh = vc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
+  const uint beg = p.window && p.pos >= p.window ? p.pos + 1 - p.window : 0;
+  float m = -1e30f, s = 0.f;
+  for (uint t = beg; t <= p.pos; ++t) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(t) * p.D + d]);
+    score *= p.scale;
+    m = t == beg ? score : max(m, score);
+    // (the running max re-walked below; a small row keeps this simple and exact)
+  }
+  float denom = 0;
+  for (uint t = beg; t <= p.pos; ++t) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(t) * p.D + d]);
+    const float wgt = metal::precise::exp(score * p.scale - m);
+    denom += wgt;
+  }
+  // third walk: the weights need the final denominator, so the value sum runs after it
+  for (uint d = 0; d < p.D; ++d) out[h * p.D + d] = 0;
+  for (uint t = beg; t <= p.pos; ++t) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(t) * p.D + d]);
+    const float wgt = metal::precise::exp(score * p.scale - m) / denom;
+    for (uint d = 0; d < p.D; ++d) out[h * p.D + d] += wgt * float(vvh[uint64_t(t) * p.D + d]);
+  }
+  const float g = sigmoid(gate[h]);
+  for (uint d = 0; d < p.D; ++d) out[h * p.D + d] *= g;
+}
+
 struct Lfm3GateParams {
   uint T;
   uint Hq;
