@@ -47,6 +47,88 @@ struct Lfm3ConvParams {
   ring_out[(p.K - 2) * p.H + c] = bfloat(u[c]);  // the newest frame
 }
 
+struct Lfm3NormParams {
+  uint D;
+  float eps;
+};
+
+// The sandwich point: out = x + w ⊙ rmsnorm(z) (post_operator_norm's and post_ffn_norm's norm before the
+// residual add). Same shape as rows_norm_f32; one threadgroup of up to 256 threads per row.
+[[kernel]] void lfm3_res_norm(const device float* z [[buffer(0)]], const device bfloat* w [[buffer(1)]],
+                              const device float* x [[buffer(2)]], device float* out [[buffer(3)]],
+                              constant Lfm3NormParams& p [[buffer(4)]], uint r [[threadgroup_position_in_grid]],
+                              uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]]) {
+  threadgroup float red[32];
+  const device float* zr = z + r * p.D;
+  float ss = 0.0f;
+  for (uint i = tid; i < p.D; i += ntg) ss += zr[i] * zr[i];
+  ss = tg_sum(ss, red, tid, ntg);
+  const float inv = metal::precise::rsqrt(ss / float(p.D) + p.eps);
+  for (uint i = tid; i < p.D; i += ntg) out[r * p.D + i] = x[r * p.D + i] + zr[i] * inv * float(w[i]);
+}
+
+// Elementwise fp32 product: u = B ⊙ x and y = C ⊙ conv(u).
+[[kernel]] void lfm3_mul(const device float* a [[buffer(0)]], const device float* b [[buffer(1)]],
+                         device float* h [[buffer(2)]], constant uint& n [[buffer(3)]],
+                         uint i [[thread_position_in_grid]]) {
+  if (i < n) h[i] = a[i] * b[i];
+}
+
+struct Lfm3QkParams {
+  uint T;      // rows this pass encodes
+  uint Hq;
+  uint Hkv;
+  uint D;      // head dim (128)
+  uint cap;    // the caches' row stride
+  uint pos0;   // the first row's position
+};
+
+// QK-RMSNorm, the zero-tail RoPE (lfm3_rope_ref's semantics: pair (i, i + D/2) rotates by pos * freqs[i],
+// the table's zero tail leaves its pairs unrotated) and the cache write. One thread per (row, head); the
+// grid's x covers Hq q heads, Hkv k heads (written to kc roped) and Hkv v heads (written to vc raw).
+[[kernel]] void lfm3_qk_prep(const device float* qkv [[buffer(0)]], const device bfloat* qw [[buffer(1)]],
+                             const device bfloat* kw [[buffer(2)]], const device float* freqs [[buffer(3)]],
+                             device half* kc [[buffer(4)]], device half* vc [[buffer(5)]],
+                             device float* q [[buffer(6)]], constant Lfm3QkParams& p [[buffer(7)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+  const uint hraw = gid.x, t = gid.y;
+  const uint QD = p.Hq * p.D, KD = p.Hkv * p.D;
+  const uint64_t row = uint64_t(t) * (QD + 2 * KD);
+  const uint pos = p.pos0 + t;
+  if (hraw < p.Hq) {  // a q head: norm, rope, out
+    const device float* x = qkv + row + uint64_t(hraw) * p.D;
+    float ss = 0;
+    for (uint d = 0; d < p.D; ++d) ss += x[d] * x[d];
+    const float inv = metal::precise::rsqrt(ss / float(p.D) + 1e-5f);
+    float n[128];
+    for (uint d = 0; d < p.D && d < 128; ++d) n[d] = x[d] * inv * float(qw[d]);
+    for (uint i = 0; i < p.D / 2; ++i) {
+      const float ang = float(pos) * freqs[i], c = metal::precise::cos(ang), s = metal::precise::sin(ang);
+      q[(uint64_t(t) * p.Hq + hraw) * p.D + i] = n[i] * c - n[p.D / 2 + i] * s;
+      q[(uint64_t(t) * p.Hq + hraw) * p.D + p.D / 2 + i] = n[p.D / 2 + i] * c + n[i] * s;
+    }
+  } else if (hraw < p.Hq + p.Hkv) {  // a k head: norm, rope, into the cache
+    const uint h = hraw - p.Hq;
+    const device float* x = qkv + row + QD + uint64_t(h) * p.D;
+    float ss = 0;
+    for (uint d = 0; d < p.D; ++d) ss += x[d] * x[d];
+    const float inv = metal::precise::rsqrt(ss / float(p.D) + 1e-5f);
+    float n[128];
+    for (uint d = 0; d < p.D && d < 128; ++d) n[d] = x[d] * inv * float(kw[d]);
+    device half* kh = kc + (uint64_t(h) * p.cap + pos) * p.D;
+    for (uint i = 0; i < p.D / 2; ++i) {
+      const float ang = float(pos) * freqs[i], c = metal::precise::cos(ang), s = metal::precise::sin(ang);
+      kh[i] = half(n[i] * c - n[p.D / 2 + i] * s);
+      kh[p.D / 2 + i] = half(n[p.D / 2 + i] * c + n[i] * s);
+    }
+  } else if (hraw < p.Hq + 2 * p.Hkv) {  // a v head: into the cache raw
+    const uint h = hraw - p.Hq - p.Hkv;
+    const device float* x = qkv + row + QD + KD + uint64_t(h) * p.D;
+    device half* vh = vc + (uint64_t(h) * p.cap + pos) * p.D;
+    for (uint d = 0; d < p.D; ++d) vh[d] = half(x[d]);
+  }
+}
+
 struct Lfm3AttnParams {
   uint Hq;     // query heads
   uint Hkv;    // key/value heads
@@ -95,6 +177,64 @@ struct Lfm3AttnParams {
   }
   const float g = sigmoid(gate[h]);
   for (uint d = 0; d < p.D; ++d) out[h * p.D + d] *= g;
+}
+
+struct Lfm3AttnPParams {
+  uint T;      // query rows this pass encodes
+  uint Hq;
+  uint Hkv;
+  uint D;
+  uint cap;
+  uint pos0;   // the first row's position
+  uint window;
+  float scale;
+};
+
+// Prefill attention: T query rows over the causal positions (the last `window` on a sliding layer), the
+// per-row sigmoid gate at the end. One thread per (row, head), correctness first; the split-K forms come
+// with the engine's measured shapes.
+[[kernel]] void lfm3_attn_p(const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]],
+                            const device half* vc [[buffer(2)]], const device float* gate [[buffer(3)]],
+                            device float* out [[buffer(4)]], constant Lfm3AttnPParams& p [[buffer(5)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+  const uint h = gid.x, t = gid.y;
+  if (h >= p.Hq || t >= p.T) return;
+  const uint pos = p.pos0 + t;
+  const device half* kkh = kc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
+  const device half* vvh = vc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
+  const uint beg = p.window && pos >= p.window ? pos + 1 - p.window : 0;
+  const device float* qh = q + (uint64_t(t) * p.Hq + h) * p.D;
+  float m = -1e30f;
+  for (uint s = beg; s <= pos; ++s) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s) * p.D + d]);
+    m = s == beg ? score * p.scale : max(m, score * p.scale);
+  }
+  float denom = 0;
+  for (uint s = beg; s <= pos; ++s) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s) * p.D + d]);
+    denom += metal::precise::exp(score * p.scale - m);
+  }
+  device float* oh = out + (uint64_t(t) * p.Hq + h) * p.D;
+  for (uint d = 0; d < p.D; ++d) oh[d] = 0;
+  for (uint s = beg; s <= pos; ++s) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s) * p.D + d]);
+    const float wgt = metal::precise::exp(score * p.scale - m) / denom;
+    for (uint d = 0; d < p.D; ++d) oh[d] += wgt * float(vvh[uint64_t(s) * p.D + d]);
+  }
+  const float g = sigmoid(gate[uint(t) * p.Hq + h]);
+  for (uint d = 0; d < p.D; ++d) oh[d] *= g;
+}
+
+// The conv ring after a prefill chunk: the last K-1 frames of u, oldest first.
+[[kernel]] void lfm3_ring_roll(const device float* u [[buffer(0)]], device bfloat* ring [[buffer(1)]],
+                               constant Lfm3ConvParams& p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  const uint c = gid;
+  if (c >= p.H) return;
+  for (uint j = 0; j + 1 < p.K; ++j)
+    ring[j * p.H + c] = bfloat(u[uint64_t(p.T - (p.K - 1) + j) * p.H + c]);
 }
 
 struct Lfm3GateParams {
