@@ -5,6 +5,7 @@
 #include "engine/stop_filter.h"
 #include "engine/reasoning_memory.h"
 #include "engine/tool_args.h"
+#include "model/lfm3.h"
 #include "model/lfm3_config.h"
 #include "model/qwen4_config.h"
 #include "splash/runtime.h"
@@ -372,6 +373,10 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   } else if (Flint::is_model(opts_.model_dir)) {
     auto m = std::make_unique<Flint>(opts_.model_dir, opts_.prefill_chunk);
     flint_ = m.get();
+    model_ = std::move(m);
+    publisher_sampling();
+  } else if (Lfm3::is_model(opts_.model_dir)) {
+    auto m = std::make_unique<Lfm3>(opts_.model_dir, opts_.prefill_chunk);
     model_ = std::move(m);
     publisher_sampling();
   } else if (Clover::is_model(opts_.model_dir)) {
@@ -777,8 +782,7 @@ std::string unsupported_model(const std::string& model_dir) {
   // the backend
   if (lfm3_family(j)) {
     if (const std::string why = lfm3_refusal(j, model_dir); !why.empty()) return why;
-    return model_dir + " is a lfm3 model, and Kapitsa's LFM3 path does not load models in this build yet: its "
-           "GGUF imports (`kapitsa import`), and the backend that runs the folder is the next change.";
+    return "";  // the LFM3 path loads it (model/lfm3.h)
   }
   if (Qwen4Exp::is_model(model_dir) || Dory::is_model(model_dir) || NemotronH::is_model(model_dir) ||
       Flint::is_model(model_dir) || Clover::is_model(model_dir))
@@ -804,7 +808,7 @@ std::string unsupported_model(const std::string& model_dir) {
     return family();
   const std::string runs = " Kapitsa runs the Qwen3.5 family (Qwen3.5, 3.6 and 3.8: qwen3_5, qwen3_5_moe), "
                            "Qwen3.8-Flash-Next (qwen4_exp), NVIDIA's Nemotron-H (nemotron_h: Nemotron Nano, Nemotron 3.5), "
-                           "Nemotron Labs Dory (dory), Recursive's Flint (flint) and DiffuSpace's Clover (clover_moe).";
+                           "Nemotron Labs Dory (dory), Recursive's Flint (flint), DiffuSpace's Clover (clover_moe) and Liquid's LFM3 (lfm3).";
   const std::string what = !mt.empty() ? mt : tt;
   if (what.empty()) return model_dir + " is not a model Kapitsa runs: its config.json names no model_type." + runs;
   return model_dir + " is a " + what + " model (its config.json's model_type), an architecture Kapitsa does not run." +
@@ -830,13 +834,14 @@ MemPlan model_plan(const std::string& model_dir, int prefill_chunk) {
                     : Flint::is_model(model_dir)    ? Flint::plan(model_dir, prefill_chunk)
                     : Qwen4Exp::is_model(model_dir) ? Qwen4Exp::plan(model_dir, prefill_chunk)
                     : NemotronH::is_model(model_dir) ? NemotronH::plan(model_dir, prefill_chunk)
+                    : Lfm3::is_model(model_dir)      ? Lfm3::plan(model_dir, prefill_chunk)
                                                      : Qwen35::plan(model_dir, prefill_chunk);
   std::lock_guard<std::mutex> lk(mu);
   plans.emplace(key, p);
   return p;
 }
 static size_t model_ane_bytes(const std::string& model_dir, const MemPlan& p) {
-  if (Dory::is_model(model_dir) || Flint::is_model(model_dir)) return 0;
+  if (Dory::is_model(model_dir) || Flint::is_model(model_dir) || Lfm3::is_model(model_dir)) return 0;
   return NemotronH::is_model(model_dir) ? p.ane : Qwen35::ane_plan(model_dir, p).bytes;
 }
 
@@ -979,8 +984,8 @@ LoadPlan plan_load(const std::string& model_dir, const std::string& dflash, bool
   // its own decoding (self-speculative or block diffusion)
   const bool clover = Clover::is_model(model_dir);
   if (clover && Clover::decode_mode() != "auto" && Clover::decode_mode() != "dflash") lp.dflash_off = true;
-  if (Dory::is_model(model_dir) || Flint::is_model(model_dir)) {
-    lp.dflash_off = true;  // no block drafter for Dory or Flint
+  if (Dory::is_model(model_dir) || Flint::is_model(model_dir) || Lfm3::is_model(model_dir)) {
+    lp.dflash_off = true;  // no block drafter for Dory, Flint or LFM3
   } else if (NemotronH::is_model(model_dir)) {
     // the block drafter (LiLiCorr, DSpark) in the model's dflash/ folder (auto), or the one named
     if (!lp.dflash_off) {

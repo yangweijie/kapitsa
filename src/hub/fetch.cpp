@@ -1122,8 +1122,7 @@ void check_supported(HttpClient& c, const Listing& L) {
   // GGUF import's folders also wait for (model/lfm3_config.h)
   if (lfm3_family(j)) {
     if (const std::string why = lfm3_refusal(j, L.repo); !why.empty()) throw Error(why);
-    throw Error(L.repo + " is an lfm3 model, and Kapitsa's LFM3 path does not load models in this build yet. Its "
-                "GGUF imports with `kapitsa import`.");
+    return;  // the LFM3 path loads it (model/lfm3.h): bf16 or MLX affine 4-bit group 32 / 8-bit group 64
   }
   if (j.value("model_type", std::string()) == "flint") {
     const json q = j.value("quantization", json::object());
