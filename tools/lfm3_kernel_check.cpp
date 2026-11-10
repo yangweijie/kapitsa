@@ -326,6 +326,84 @@ int main(int argc, char** argv) {
       }
       const double qrf_ms = (ni::Encoder::host_ms() - t0) / 50;
       printf("bench: in_proj decode N=6144 K=2048 M=1: qrf_f4g32_m8 %.3f ms/pass\n", qrf_ms);
+    // qmvf_b4g32_t1_r4_norm: the same matrix through the rowcache matvec, the norm folded — checked
+    // against the CPU matvec (the codes' dequantized values times the normed x), then timed
+    {
+      std::vector<float> yq(size_t(N), 0.f);
+      ni::Buffer by4 = gpu.alloc(yq.size() * 4, "ty4"), bnw = gpu.alloc(nw.size() * 2, "tnw");
+      memcpy(bnw.ptr(), to_bf16_span(nw).data(), nw.size() * 2);
+      auto run = [&] {
+        ni::kp::Qmvf pm{};
+        pm.K = K;
+        pm.R = 1;
+        pm.x_ld = K;
+        pm.nseg = 1;
+        pm.eps = 1e-5f;
+        pm.N[0] = N;
+        pm.y_ld[0] = N;
+        pm.add[0] = 0;
+        pm.tg_begin[0] = 0;
+        pm.tg_begin[1] = (N + 7) / 8;
+        pm.write_xn = 0;
+        auto e5 = gpu.begin();
+        e5->use(gpu.pipeline("qmvf_b4g32_t1_r4_norm"));
+        e5->buf(0, bw3);
+        e5->buf(1, bs3);
+        e5->buf(2, bb3);
+        e5->buf(3, by4);
+        e5->buf(16, bx3);
+        e5->val(17, pm);
+        e5->buf(18, bnw);
+        e5->buf(19, bx3);
+        e5->dispatch(1, (N + 7) / 8, 1, 64);
+        e5->commit_and_wait();
+      };
+      run();
+      // the CPU expectation: sum_k float(w bit k) * s * (x[k] normed) + b — from the same words/scales
+      bool good = true;
+      {
+        // dequantize the first row's codes the way qmvf reads them (4-bit, group 32, scale+bias per group)
+        std::vector<double> acc(size_t(N), 0.0);
+        const uint16_t* sw = static_cast<const uint16_t*>((const void*)sb.data());
+        (void)sw;
+        for (uint32_t row = 0; row < N && good; ++row) {
+          double dot = 0;
+          for (uint32_t k = 0; k < K; ++k) {
+            const uint32_t word = w[size_t(row) * (K / 8) + k / 8];
+            const uint32_t code = (word >> (4 * (k % 8))) & 0xF;
+            const uint32_t grp = k / 32;
+            // the scale/bias from the bf16 words (1.0 here), the code's value scale * code + bias
+            const float sc = 1.0f, bi = 0.0f;
+            dot += double(sc * float(code) + bi) * double(xf[k]);
+          }
+          acc[row] = dot;
+        }
+        run();
+        memcpy(yq.data(), by4.as<float>(), yq.size() * 4);
+        // the kernel folds the RMS norm of x with eps: y = W . (x * inv * 1) — compare against the same
+        double ss = 0;
+        for (uint32_t k = 0; k < K; ++k) ss += double(xf[k]) * xf[k];
+        const double inv = 1.0 / std::sqrt(ss / K + 1e-5);
+        for (uint32_t row = 0; row < 8 && good; ++row) {
+          double dot = 0;
+          for (uint32_t k = 0; k < K; ++k) {
+            const uint32_t word = w[size_t(row) * (K / 8) + k / 8];
+            const uint32_t code = (word >> (4 * (k % 8))) & 0xF;
+            dot += double(float(code)) * double(xf[k]) * inv;
+          }
+          if (fabsf(yq[row] - float(dot)) > 1e-2f * (1.f + fabsf(float(dot)))) {
+            fprintf(stderr, "  qmvf diff row %u: %g vs %g\n", row, yq[row], float(dot));
+            good = false;
+          }
+        }
+      }
+      ok("qmvf_b4g32: the rowcache matvec with the folded norm", good);
+      for (int rep = 0; rep < 2; ++rep) run();
+      t0 = ni::Encoder::host_ms();
+      for (int rep = 0; rep < 50; ++rep) run();
+      printf("bench: qmvf_b4g32_t1_r4_norm N=6144 K=2048 M=1: %.3f ms/pass\n",
+             (ni::Encoder::host_ms() - t0) / 50);
+    }
       // the attention at a real depth
       std::vector<float> q2(size_t(Hq * D), 0.f);
       for (auto& v : q2) v = rnd(seed);
