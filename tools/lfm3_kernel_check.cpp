@@ -911,6 +911,94 @@ int main(int argc, char** argv) {
     }
   }
 
+  // the prefill attention and the ring roll (the two kernels whose loss a decode-only run cannot see)
+  {
+    const uint32_t T = 6, Hq = 4, Hkv = 2, D = 128, cap = 64;
+    const float scale = 1.f / std::sqrt(float(D));
+    uint32_t seed = 4242;
+    std::vector<float> q(size_t(T * Hq * D)), gate(size_t(T * Hq)), out(size_t(T * Hq * D), 0.f);
+    std::vector<_Float16> kc(size_t(Hkv * cap * D), _Float16(0.f)), vc(size_t(Hkv * cap * D), _Float16(0.f));
+    for (auto& v : q) v = rnd(seed);
+    for (auto& v : gate) v = rnd(seed);
+    for (auto& v : kc) v = _Float16(rnd(seed) / 4.f);
+    for (auto& v : vc) v = _Float16(rnd(seed) / 4.f);
+    ni::Buffer bq = gpu.alloc(q.size() * 4, "fpq"), bkc = gpu.alloc(kc.size() * 2, "fpkc"),
+               bvc = gpu.alloc(vc.size() * 2, "fpvc"), bg = gpu.alloc(gate.size() * 4, "fpgate"),
+               bo = gpu.alloc(out.size() * 4, "fpout");
+    memcpy(bq.ptr(), q.data(), q.size() * 4);
+    memcpy(bkc.ptr(), kc.data(), kc.size() * 2);
+    memcpy(bvc.ptr(), vc.data(), vc.size() * 2);
+    memcpy(bg.ptr(), gate.data(), gate.size() * 4);
+    const uint32_t pos0 = 3, window = 8;
+    const Lfm3AttnPParams ap{T, Hq, Hkv, D, cap, pos0, window, scale};
+    auto e = gpu.begin();
+    e->use(gpu.pipeline("lfm3_attn_p"));
+    e->buf(0, bq);
+    e->buf(1, bkc);
+    e->buf(2, bvc);
+    e->buf(3, bg);
+    e->buf(4, bo);
+    e->val(5, ap);
+    e->dispatch(Hq, T, 1, 1);
+    e->commit_and_wait();
+    bool good = true;
+    for (uint32_t t = 0; t < T && good; ++t) {
+      const uint32_t pos = pos0 + t, beg = pos >= window ? pos + 1 - window : 0;
+      for (uint32_t h = 0; h < Hq && good; ++h) {
+        const _Float16* kkh = kc.data() + uint64_t(h / (Hq / Hkv)) * cap * D;
+        const _Float16* vvh = vc.data() + uint64_t(h / (Hq / Hkv)) * cap * D;
+        double mx = -1e300;
+        std::vector<double> sc(size_t(pos - beg + 1));
+        for (uint32_t s = beg; s <= pos; ++s) {
+          double acc = 0;
+          for (uint32_t d = 0; d < D; ++d)
+            acc += double(q[(size_t(t) * Hq + h) * D + d]) * double(kkh[uint64_t(s) * D + d]);
+          sc[size_t(s - beg)] = acc * scale;
+          mx = std::max(mx, sc[size_t(s - beg)]);
+        }
+        double den = 0;
+        for (double v : sc) den += std::exp(v - mx);
+        for (uint32_t d = 0; d < D; ++d) {
+          double acc = 0;
+          for (uint32_t s = beg; s <= pos; ++s)
+            acc += std::exp(sc[size_t(s - beg)] - mx) / den * double(vvh[uint64_t(s) * D + d]);
+          const float want = float(acc * (1.0 / (1.0 + std::exp(-double(gate[size_t(t) * Hq + h])))));
+          const float got = bo.as<float>()[(size_t(t) * Hq + h) * D + d];
+          if (fabsf(got - want) > 2e-3f * (1.f + fabsf(want))) {
+            fprintf(stderr, "  attn_p diff t%u h%u d%u: %g vs %g\n", t, h, d, got, want);
+            good = false;
+            break;
+          }
+        }
+      }
+    }
+    ok("attn_p: the prefill attention with the window and the gate", good);
+    // the ring roll
+    {
+      const uint32_t H2 = 128, K2 = 7, T2 = 20;
+      std::vector<float> u(size_t(T2 * H2));
+      std::vector<uint16_t> ring(size_t((K2 - 1) * H2), 0);
+      for (auto& v : u) v = rnd(seed);
+      ni::Buffer bu = gpu.alloc(u.size() * 4, "fpu"), brg = gpu.alloc(ring.size() * 2, "fpg");
+      memcpy(bu.ptr(), u.data(), u.size() * 4);
+      const Lfm3ConvParams cp{T2, H2, K2};
+      auto e2 = gpu.begin();
+      e2->use(gpu.pipeline("lfm3_ring_roll"));
+      e2->buf(0, bu);
+      e2->buf(1, brg);
+      e2->val(2, cp);
+      e2->dispatch(H2, 1, 1, 1);
+      e2->commit_and_wait();
+      bool good2 = true;
+      for (uint32_t j = 0; j < K2 - 1; ++j)
+        for (uint32_t i = 0; i < H2; ++i) {
+          const float want = u[size_t(T2 - (K2 - 1) + j) * H2 + i];
+          good2 = good2 && fabsf(from_bf16(brg.as<uint16_t>()[size_t(j) * H2 + i]) - want) <= 2e-2f * (1.f + fabsf(want));
+        }
+      ok("ring roll: the chunk's last K-1 frames", good2);
+    }
+  }
+
   printf("%s (%d ok, %d failed)\n", g_fail ? "FAIL" : "PASS", g_ok, g_fail);
   return g_fail ? 1 : 0;
 }
