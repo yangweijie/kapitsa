@@ -184,6 +184,11 @@ struct Lfm3NormParams {
   uint32_t D;
   float eps;
 };
+struct Lfm3AttnSplitParams {
+  uint32_t Hq, Hkv, D, cap, pos, window, splits;
+  float scale;
+};
+static constexpr uint32_t kAttnSplits = 32;
 struct Lfm3ConvParams {
   uint32_t T, H, K;
 };
@@ -309,6 +314,9 @@ void Lfm3::load() {
   hh_ = g.alloc(R * i * 2, "lfm3_hh");
   xn_ = g.alloc(kMaxRows * h * 4, "lfm3_xn");
   logits_ = g.alloc(size_t(V) * 4, "lfm3_logits");
+  apart_o_ = g.alloc(size_t(cfg_.hq) * kAttnSplits * size_t(cfg_.hd) * 4, "lfm3_apart_o");
+  apart_m_ = g.alloc(size_t(cfg_.hq) * kAttnSplits * 4, "lfm3_apart_m");
+  apart_s_ = g.alloc(size_t(cfg_.hq) * kAttnSplits * 4, "lfm3_apart_s");
   const uint32_t ntg = (V + 2047) / 2048, K = 32;
   cand_v_ = g.alloc(size_t(ntg * K) * 4, "lfm3_cand_v");
   cand_i_ = g.alloc(size_t(ntg * K) * 4, "lfm3_cand_i");
@@ -650,16 +658,25 @@ void Lfm3::encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, ui
       e.buf(6, q_);
       e.val(7, qp);
       e.dispatch(uint32_t(cfg_.hq) + 2 * uint32_t(cfg_.hkv), 1, 1, 1);
-      const Lfm3AttnParams ap{uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.hd), cache_cap,
-                              uint32_t(pos), window_of(l), 1.f / std::sqrt(float(cfg_.hd))};
-      e.use(pipe("lfm3_attn_d"));
+      const Lfm3AttnSplitParams ap{uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.hd), cache_cap,
+                                   uint32_t(pos), window_of(l), kAttnSplits, 1.f / std::sqrt(float(cfg_.hd))};
+      e.use(pipe("lfm3_attn_d_split"));
       e.buf(0, q_);
       e.buf(1, s.kc[size_t(l)]);
       e.buf(2, s.vc[size_t(l)]);
+      e.buf(3, apart_o_);
+      e.buf(4, apart_m_);
+      e.buf(5, apart_s_);
+      e.val(6, ap);
+      e.dispatch(uint32_t(cfg_.hq), kAttnSplits, 1, 1);
+      e.use(pipe("lfm3_attn_d_merge"));
+      e.buf(0, apart_o_);
+      e.buf(1, apart_m_);
+      e.buf(2, apart_s_);
       e.buf(3, gate_);
       e.buf(4, ao_);
       e.val(5, ap);
-      e.dispatch(uint32_t(cfg_.hq), 1, 1, 1);
+      e.dispatch(uint32_t(cfg_.hq), uint32_t(cfg_.hd), 1, 1);
       to_half(e, ao_, nullptr, aoh_, 1);
       lin(e, L.o, aoh_, mx_, 1, false, 0);
     }

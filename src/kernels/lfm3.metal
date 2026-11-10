@@ -159,108 +159,73 @@ struct Lfm3AttnParams {
   float scale; // 1 / sqrt(D)
 };
 
-// Plain decode attention at head dim 128, one thread per query head (correctness first; the split-K forms
-// come with the engine's measured shapes). q is one row, normed and roped; the caches hold fp16 rows
-// [Hkv, cap, D]; the softmax runs over the causal positions, the last `window` of them on a sliding layer.
-// The per-head sigmoid gate multiplies the head's output before it returns.
-[[kernel]] void lfm3_attn_d(const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]],
-                            const device half* vc [[buffer(2)]], const device float* gate [[buffer(3)]],
-                            device float* out [[buffer(4)]], constant Lfm3AttnParams& p [[buffer(5)]],
-                            uint gid [[thread_position_in_grid]]) {
-  const uint h = gid;
-  if (h >= p.Hq) return;
-  const device half* kkh = kc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
-  const device half* vvh = vc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
-  const uint beg = p.window && p.pos >= p.window ? p.pos + 1 - p.window : 0;
-  float m = -1e30f, s = 0.f;
-  for (uint t = beg; t <= p.pos; ++t) {
-    const uint slot = t % p.cap;  // a sliding layer's ring wraps; a growing cache holds every position
-    float score = 0;
-    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(slot) * p.D + d]);
-    score *= p.scale;
-    m = t == beg ? score : max(m, score);
-    // (the running max re-walked below; a small row keeps this simple and exact)
-  }
-  float denom = 0;
-  for (uint t = beg; t <= p.pos; ++t) {
-    const uint slot = t % p.cap;
-    float score = 0;
-    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(slot) * p.D + d]);
-    const float wgt = metal::precise::exp(score * p.scale - m);
-    denom += wgt;
-  }
-  // third walk: the weights need the final denominator, so the value sum runs after it
-  for (uint d = 0; d < p.D; ++d) out[h * p.D + d] = 0;
-  for (uint t = beg; t <= p.pos; ++t) {
-    const uint slot = t % p.cap;
-    float score = 0;
-    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(slot) * p.D + d]);
-    const float wgt = metal::precise::exp(score * p.scale - m) / denom;
-    for (uint d = 0; d < p.D; ++d) out[h * p.D + d] += wgt * float(vvh[uint64_t(slot) * p.D + d]);
-  }
-  const float g = sigmoid(gate[h]);
-  for (uint d = 0; d < p.D; ++d) out[h * p.D + d] *= g;
-}
-
-struct Lfm3AttnPParams {
-  uint T;      // query rows this pass encodes
+// Plain decode attention at head dim 128, split over the positions: kernel 1 gives each (head, split) a
+// contiguous chunk of the causal range and writes its partial output, running max and sum; kernel 2 merges
+// the splits (the online-softmax merge) and applies the per-head sigmoid gate. SPLITS = the grid's y (the
+// params' splits); a split whose chunk lies past `pos` contributes nothing (its max is -inf). q is one row,
+// normed and roped; the caches hold fp16 rows [Hkv, cap, D]; a sliding layer's ring wraps (slot = t % cap).
+struct Lfm3AttnSplitParams {
   uint Hq;
   uint Hkv;
   uint D;
   uint cap;
-  uint pos0;   // the first row's position
+  uint pos;
   uint window;
+  uint splits;
   float scale;
 };
-
-// Prefill attention: T query rows over the causal positions (the last `window` on a sliding layer), the
-// per-row sigmoid gate at the end. One thread per (row, head), correctness first; the split-K forms come
-// with the engine's measured shapes.
-[[kernel]] void lfm3_attn_p(const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]],
-                            const device half* vc [[buffer(2)]], const device float* gate [[buffer(3)]],
-                            device float* out [[buffer(4)]], constant Lfm3AttnPParams& p [[buffer(5)]],
-                            uint2 gid [[thread_position_in_grid]]) {
-  const uint h = gid.x, t = gid.y;
-  if (h >= p.Hq || t >= p.T) return;
-  const uint pos = p.pos0 + t;
+[[kernel]] void lfm3_attn_d_split(const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]],
+                                  const device half* vc [[buffer(2)]], device float* part_o [[buffer(3)]],
+                                  device float* part_m [[buffer(4)]], device float* part_s [[buffer(5)]],
+                                  constant Lfm3AttnSplitParams& p [[buffer(6)]], uint2 gid [[thread_position_in_grid]]) {
+  const uint h = gid.x, sp = gid.y;
+  if (h >= p.Hq || sp >= p.splits) return;
   const device half* kkh = kc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
   const device half* vvh = vc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
-  const uint beg = p.window && pos >= p.window ? pos + 1 - p.window : 0;
-  const device float* qh = q + (uint64_t(t) * p.Hq + h) * p.D;
+  const uint beg = p.window && p.pos >= p.window ? p.pos + 1 - p.window : 0;
+  const uint len = p.pos - beg + 1, chunk = (len + p.splits - 1) / p.splits;
+  const uint lo = beg + sp * chunk;
+  const uint hi = metal::min(lo + chunk, p.pos + 1);
+  const device float* qh = q + h * p.D;
   float m = -1e30f;
-  for (uint s = beg; s <= pos; ++s) {
-    const uint slot = s % p.cap;  // a sliding layer's ring wraps; a growing cache holds every position
+  for (uint t = lo; t < hi; ++t) {
+    const uint slot = t % p.cap;
     float score = 0;
     for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(slot) * p.D + d]);
-    m = s == beg ? score * p.scale : max(m, score * p.scale);
+    m = max(m, score * p.scale);
   }
-  float denom = 0;
-  for (uint s = beg; s <= pos; ++s) {
-    const uint slot = s % p.cap;
-    float score = 0;
-    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(slot) * p.D + d]);
-    denom += metal::precise::exp(score * p.scale - m);
-  }
-  device float* oh = out + (uint64_t(t) * p.Hq + h) * p.D;
+  device float* oh = part_o + (uint64_t(h) * p.splits + sp) * p.D;
   for (uint d = 0; d < p.D; ++d) oh[d] = 0;
-  for (uint s = beg; s <= pos; ++s) {
-    const uint slot = s % p.cap;
+  float denom = 0;
+  for (uint t = lo; t < hi; ++t) {
+    const uint slot = t % p.cap;
     float score = 0;
     for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(slot) * p.D + d]);
-    const float wgt = metal::precise::exp(score * p.scale - m) / denom;
+    const float wgt = metal::precise::exp(score * p.scale - m);
+    denom += wgt;
     for (uint d = 0; d < p.D; ++d) oh[d] += wgt * float(vvh[uint64_t(slot) * p.D + d]);
   }
-  const float g = sigmoid(gate[uint(t) * p.Hq + h]);
-  for (uint d = 0; d < p.D; ++d) oh[d] *= g;
+  part_m[uint64_t(h) * p.splits + sp] = hi > lo ? m : -1e30f;
+  part_s[uint64_t(h) * p.splits + sp] = hi > lo ? denom : 0.f;
 }
 
-// The conv ring after a prefill chunk: the last K-1 frames of u, oldest first.
-[[kernel]] void lfm3_ring_roll(const device float* u [[buffer(0)]], device bfloat* ring [[buffer(1)]],
-                               constant Lfm3ConvParams& p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
-  const uint c = gid;
-  if (c >= p.H) return;
-  for (uint j = 0; j + 1 < p.K; ++j)
-    ring[j * p.H + c] = bfloat(u[uint64_t(p.T - (p.K - 1) + j) * p.H + c]);
+// The merge: out[h] = (sum_s part_o * exp(part_m - M)) / (sum_s part_s * exp(part_m - M)) * sigmoid(gate),
+// one thread per (head, dim).
+[[kernel]] void lfm3_attn_d_merge(const device float* part_o [[buffer(0)]], const device float* part_m [[buffer(1)]],
+                                  const device float* part_s [[buffer(2)]], const device float* gate [[buffer(3)]],
+                                  device float* out [[buffer(4)]], constant Lfm3AttnSplitParams& p [[buffer(5)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+  const uint h = gid.x, d = gid.y;
+  if (h >= p.Hq || d >= p.D) return;
+  float M = -1e30f;
+  for (uint sp = 0; sp < p.splits; ++sp) M = max(M, part_m[uint64_t(h) * p.splits + sp]);
+  float num = 0, den = 0;
+  for (uint sp = 0; sp < p.splits; ++sp) {
+    const float wgt = metal::precise::exp(part_m[uint64_t(h) * p.splits + sp] - M);
+    num += wgt * part_o[(uint64_t(h) * p.splits + sp) * p.D + d];
+    den += wgt * part_s[uint64_t(h) * p.splits + sp];
+  }
+  out[h * p.D + d] = num / den * sigmoid(gate[h]);
 }
 
 struct Lfm3GateParams {
