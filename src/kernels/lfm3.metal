@@ -74,6 +74,26 @@ struct Lfm3NormParams {
   if (i < n) h[i] = a[i] * b[i];
 }
 
+struct Lfm3BcxParams {
+  uint T;      // rows
+  uint H;      // hidden, the width of one plane
+  uint which;  // 0: u = B ⊙ x, 1: y = C ⊙ z
+};
+
+// The in_proj output is [T, 3H] with (B, C, x) inside each row, not three planar [T, H] buffers.
+// which 0 reads B and x into u, which 1 reads C and multiplies the conv's z into y. One thread per
+// (channel, row); the decode path keeps lfm3_mul, where T = 1 makes the two layouts agree.
+[[kernel]] void lfm3_bcx(const device float* bcx [[buffer(0)]], const device float* z [[buffer(1)]],
+                         device float* out [[buffer(2)]], constant Lfm3BcxParams& p [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+  const uint c = gid.x, t = gid.y;
+  if (c >= p.H || t >= p.T) return;
+  const uint64_t row = uint64_t(t) * (3 * p.H);
+  const float a = p.which == 0 ? bcx[row + c] : bcx[row + p.H + c];
+  const float b = p.which == 0 ? bcx[row + 2 * p.H + c] : z[uint64_t(t) * p.H + c];
+  out[uint64_t(t) * p.H + c] = a * b;
+}
+
 struct Lfm3QkParams {
   uint T;      // rows this pass encodes
   uint Hq;
@@ -115,7 +135,7 @@ struct Lfm3QkParams {
     const float inv = metal::precise::rsqrt(ss / float(p.D) + 1e-5f);
     float n[128];
     for (uint d = 0; d < p.D && d < 128; ++d) n[d] = x[d] * inv * float(kw[d]);
-    device half* kh = kc + (uint64_t(h) * p.cap + pos) * p.D;
+    device half* kh = kc + (uint64_t(h) * p.cap + pos % p.cap) * p.D;
     for (uint i = 0; i < p.D / 2; ++i) {
       const float ang = float(pos) * freqs[i], c = metal::precise::cos(ang), s = metal::precise::sin(ang);
       kh[i] = half(n[i] * c - n[p.D / 2 + i] * s);
@@ -124,7 +144,7 @@ struct Lfm3QkParams {
   } else if (hraw < p.Hq + 2 * p.Hkv) {  // a v head: into the cache raw
     const uint h = hraw - p.Hq - p.Hkv;
     const device float* x = qkv + row + QD + KD + uint64_t(h) * p.D;
-    device half* vh = vc + (uint64_t(h) * p.cap + pos) * p.D;
+    device half* vh = vc + (uint64_t(h) * p.cap + pos % p.cap) * p.D;
     for (uint d = 0; d < p.D; ++d) vh[d] = half(x[d]);
   }
 }
@@ -154,26 +174,29 @@ struct Lfm3AttnParams {
   const uint beg = p.window && p.pos >= p.window ? p.pos + 1 - p.window : 0;
   float m = -1e30f, s = 0.f;
   for (uint t = beg; t <= p.pos; ++t) {
+    const uint slot = t % p.cap;  // a sliding layer's ring wraps; a growing cache holds every position
     float score = 0;
-    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(t) * p.D + d]);
+    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(slot) * p.D + d]);
     score *= p.scale;
     m = t == beg ? score : max(m, score);
     // (the running max re-walked below; a small row keeps this simple and exact)
   }
   float denom = 0;
   for (uint t = beg; t <= p.pos; ++t) {
+    const uint slot = t % p.cap;
     float score = 0;
-    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(t) * p.D + d]);
+    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(slot) * p.D + d]);
     const float wgt = metal::precise::exp(score * p.scale - m);
     denom += wgt;
   }
   // third walk: the weights need the final denominator, so the value sum runs after it
   for (uint d = 0; d < p.D; ++d) out[h * p.D + d] = 0;
   for (uint t = beg; t <= p.pos; ++t) {
+    const uint slot = t % p.cap;
     float score = 0;
-    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(t) * p.D + d]);
+    for (uint d = 0; d < p.D; ++d) score += q[h * p.D + d] * float(kkh[uint64_t(slot) * p.D + d]);
     const float wgt = metal::precise::exp(score * p.scale - m) / denom;
-    for (uint d = 0; d < p.D; ++d) out[h * p.D + d] += wgt * float(vvh[uint64_t(t) * p.D + d]);
+    for (uint d = 0; d < p.D; ++d) out[h * p.D + d] += wgt * float(vvh[uint64_t(slot) * p.D + d]);
   }
   const float g = sigmoid(gate[h]);
   for (uint d = 0; d < p.D; ++d) out[h * p.D + d] *= g;
@@ -206,23 +229,26 @@ struct Lfm3AttnPParams {
   const device float* qh = q + (uint64_t(t) * p.Hq + h) * p.D;
   float m = -1e30f;
   for (uint s = beg; s <= pos; ++s) {
+    const uint slot = s % p.cap;  // a sliding layer's ring wraps; a growing cache holds every position
     float score = 0;
-    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s) * p.D + d]);
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(slot) * p.D + d]);
     m = s == beg ? score * p.scale : max(m, score * p.scale);
   }
   float denom = 0;
   for (uint s = beg; s <= pos; ++s) {
+    const uint slot = s % p.cap;
     float score = 0;
-    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s) * p.D + d]);
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(slot) * p.D + d]);
     denom += metal::precise::exp(score * p.scale - m);
   }
   device float* oh = out + (uint64_t(t) * p.Hq + h) * p.D;
   for (uint d = 0; d < p.D; ++d) oh[d] = 0;
   for (uint s = beg; s <= pos; ++s) {
+    const uint slot = s % p.cap;
     float score = 0;
-    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s) * p.D + d]);
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(slot) * p.D + d]);
     const float wgt = metal::precise::exp(score * p.scale - m) / denom;
-    for (uint d = 0; d < p.D; ++d) oh[d] += wgt * float(vvh[uint64_t(s) * p.D + d]);
+    for (uint d = 0; d < p.D; ++d) oh[d] += wgt * float(vvh[uint64_t(slot) * p.D + d]);
   }
   const float g = sigmoid(gate[uint(t) * p.Hq + h]);
   for (uint d = 0; d < p.D; ++d) oh[d] *= g;

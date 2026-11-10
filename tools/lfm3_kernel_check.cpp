@@ -2,7 +2,10 @@
 // sizes, and the imported folder's tokenizer against texts given as arguments. Takes no GPU lock itself: run it
 // under `lockf -k /tmp/kapitsa-gpu.lock` (its header says so, as fn_check's does). First runs of a new kernel go
 // at these small sizes with MTL_SHADER_VALIDATION=1 MTL_DEBUG_LAYER=1.
-//   lfm3_kernel_check kernels        the conv prefill / decode / gate pack vs the references
+//   lfm3_kernel_check kernels        the conv prefill / decode / gate pack / bcx planes vs the references
+//   lfm3_kernel_check logits DIR ... the backend's top-8 next-token logits for a prompt
+//   lfm3_kernel_check sample        the two-stage sampler at the real vocab size
+//   lfm3_kernel_check chain         the QK prep, the 4-bit GEMM and the decode attention chained
 //   lfm3_kernel_check tok DIR ...    encode each argument with DIR's tokenizer.json, one "tok <n> ids" line
 #include "metal/gpu.h"
 #include "model/kparams.h"
@@ -51,6 +54,9 @@ struct Lfm3AttnPParams {
   uint32_t T, Hq, Hkv, D, cap, pos0, window;
   float scale;
 };
+struct Lfm3BcxParams {
+  uint32_t T, H, which;
+};
 
 uint32_t lcg(uint32_t& s) { return s = s * 1664525u + 1013904223u; }
 
@@ -79,7 +85,7 @@ float from_bf16(uint16_t b) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    fprintf(stderr, "usage: lfm3_kernel_check kernels | tok DIR TEXT...\n");
+    fprintf(stderr, "usage: lfm3_kernel_check kernels | logits DIR ID... | sample | chain | tok DIR TEXT...\n");
     return 2;
   }
   const std::string mode = argv[1];
@@ -96,12 +102,243 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (mode == "logits") {
+    // lfm3_kernel_check logits MODEL_DIR ID ID ID... : the backend's top-8 next-token logits for the prompt
+    if (argc < 4) return 2;
+    std::vector<int> ids;
+    for (int i = 3; i < argc; ++i) ids.push_back(atoi(argv[i]));
+    ni::Lfm3 m(argv[2], 2048);
+    auto s = m.new_seq(8192);
+    memcpy(s->tok.as<int>(), ids.data(), ids.size() * 4);
+    ni::SamplingParams sp{0.f, 1.0f, 0, 0};
+    auto e = ni::Gpu::get().begin();
+    m.encode_prefill(*e, *s, 0, int(ids.size()), sp, 0, true);
+    e->commit_and_wait();
+    const float* lg = m.logits_for_debug();
+    std::vector<int> top(8);
+    std::vector<float> val(8, -1e30f);
+    for (int v = 0; v < m.vocab(); ++v)
+      for (int j = 0; j < 8; ++j)
+        if (lg[v] > val[j]) {
+          for (int k = 7; k > j; --k) val[k] = val[k - 1], top[k] = top[k - 1];
+          val[j] = lg[v], top[j] = v;
+          break;
+        }
+    printf("kapitsa top8 ids:");
+    for (int j = 0; j < 8; ++j) printf(" %d", top[j]);
+    printf("\nkapitsa top8 logits:");
+    for (int j = 0; j < 8; ++j) printf(" %.3f", val[j]);
+    printf("\n");
+    return 0;
+  }
+  if (mode == "sample") {
+    // the engine's two-stage sampling exactly: topk_stage1 (63 threadgroups of 256 over a 128000 vocab) then
+    // sample_stage2 (one threadgroup of 1024), with the buffer sizes the LFM3 backend allocates
+    ni::Gpu& gpu = ni::Gpu::get();
+    const uint32_t V = 128000, ntg = (V + 2047) / 2048;
+    uint32_t seed = 99;
+    std::vector<float> logits(size_t(V), 0.f);
+    for (auto& v : logits) v = rnd(seed);
+    logits[12345] = 88.f;  // the argmax for temp 0
+    ni::Buffer bl = gpu.alloc(logits.size() * 4, "logits"), bv = gpu.alloc(size_t(ntg * 32) * 4, "cand_v"),
+               bi = gpu.alloc(size_t(ntg * 32) * 4, "cand_i"), bt = gpu.alloc((8192 + 8) * 4, "tok"),
+               bs = gpu.alloc(64 * 4, "sprob");
+    memcpy(bl.ptr(), logits.data(), logits.size() * 4);
+    memset(bt.ptr(), 0, bt.size);
+    // the tied head GEMM as the engine runs it: N=128000, K=2048, 8-bit group 64, one row of a 40-row xh
+    {
+      const uint32_t H = 2048;
+      std::vector<uint32_t> w(size_t(V) * (H / 8));
+      std::vector<uint16_t> sb(size_t(V) * (H / 64));
+      for (auto& v : w) v = lcg(seed);
+      for (auto& v : sb) v = uint16_t(0x3f80);  // bf16 1.0
+      std::vector<uint16_t> xh(size_t(40) * H);
+      for (auto& v : xh) v = uint16_t(0x3c00);  // bf16... half 1.0
+      ni::Buffer bw = gpu.alloc(w.size() * 4, "hw"), bs = gpu.alloc(sb.size() * 2, "hs"),
+                 bb = gpu.alloc(sb.size() * 2, "hb"), bx = gpu.alloc(xh.size() * 2, "hx"),
+                 by = gpu.alloc(size_t(V) * 4, "hy");
+      memcpy(bw.ptr(), w.data(), w.size() * 4);
+      memcpy(bs.ptr(), sb.data(), sb.size() * 2);
+      memcpy(bb.ptr(), sb.data(), sb.size() * 2);
+      memcpy(bx.ptr(), xh.data(), xh.size() * 2);
+      const ni::kp::Qmm p{1, V, H, H, V, 0, 64, 0, 0};
+      auto e0 = gpu.begin();
+      e0->use(gpu.pipeline("qmr8_k32_w14_m16_n64"));
+      e0->buf(0, bx);
+      e0->buf(1, bw);
+      e0->buf(2, bs);
+      e0->buf(3, bb);
+      e0->buf(4, by);
+      e0->val(5, p);
+      e0->dispatch((V + 63) / 64, 1, 1, 128);
+      e0->commit_and_wait();
+      ok("head: the tied 8-bit GEMM over the whole vocab", by.as<float>()[12345] != 0.f);
+    }
+    for (const float temp : {0.f, 0.1f}) {
+      const uint32_t K = temp > 0 ? 32u : 1u;
+      const ni::kp::TopkStage ts{V, K, 2048};
+      auto e = gpu.begin();
+      e->use(gpu.pipeline("topk_stage1"));
+      e->buf(0, bl);
+      e->buf(1, bv);
+      e->buf(2, bi);
+      e->val(3, ts);
+      e->dispatch(ntg, 1, 1, 256);
+      const ni::kp::Sample sp2{ntg * K, K, temp, 0.95f, 7u, 3u, 5u};
+      e->use(gpu.pipeline("sample_stage2"));
+      e->buf(0, bv);
+      e->buf(1, bi);
+      e->buf(2, bt);
+      e->buf(3, bs);
+      e->val(4, sp2);
+      e->dispatch(1, 1, 1, 1024);
+      e->commit_and_wait();
+      const int got = bt.as<int>()[5];
+      char nm[64];
+      snprintf(nm, sizeof nm, "sample: temp %.1f draws a vocab id", temp);
+      ok(nm, got >= 0 && got < int(V), "got " + std::to_string(got));
+      if (temp == 0.f) ok("sample: temp 0 takes the argmax", got == 12345, "got " + std::to_string(got));
+    }
+    printf("%s (%d ok, %d failed)\n", g_fail ? "FAIL" : "PASS", g_ok, g_fail);
+    return g_fail ? 1 : 0;
+  }
+  if (mode == "chain") {
+    // the decode step at the engine's real dimensions: the attention half of layer 2 (the first attention
+    // layer) — the qkv linears' packed row, the QK prep, then the decode attention
+    ni::Gpu& gpu = ni::Gpu::get();
+    const uint32_t H = 2048, QD = 2048, KD = 512, Hq = 16, Hkv = 4, D = 128, cap = 8192, pos = 10;
+    uint32_t seed = 555;
+    std::vector<float> qkv(size_t(QD + 2 * KD)), q(size_t(QD), 0.f), gate(size_t(Hq), 0.f),
+        ao(size_t(QD), 0.f),
+        qw(D), kw(D), freqs(64, 0.f);
+    std::vector<uint16_t> wq(size_t(QD * (H / 8)), uint16_t(0)), wk(size_t(KD * (H / 8)), uint16_t(0)),
+        wv(size_t(KD * (H / 8)), uint16_t(0)), wo(size_t(H * (QD / 8)), uint16_t(0)),
+        wg(size_t(Hq * (H / 8)), uint16_t(0)), sq(size_t(QD * (H / 64)), uint16_t(0)),
+        sk(size_t(KD * (H / 64)), uint16_t(0)), sv(size_t(KD * (H / 64)), uint16_t(0)),
+        so(size_t(H * (QD / 64)), uint16_t(0)), sg(size_t(Hq * (H / 64)), uint16_t(0));
+    std::vector<_Float16> kc(size_t(Hkv * cap * D), _Float16(0.f)), vc(size_t(Hkv * cap * D), _Float16(0.f));
+    std::vector<uint16_t> xh2(size_t(40) * H, uint16_t(0x3c00));  // half 1.0, the engine's xh_ sizing
+    for (auto& v : qkv) v = rnd(seed);
+    for (auto& v : gate) v = rnd(seed);
+    for (auto& v : qw) v = uint16_t(lcg(seed) % 0x10000);
+    for (auto& v : sq) v = uint16_t(0x3f80);
+    wk = wq, sk = sq, wv = wq, sv = sq, wo = wq, so = sq, wg = wq, sg = sq;  // shapes, not values
+    const std::vector<float> g = ni::lfm3_rope_freqs(1e6, 0.5, 128);
+    for (size_t i = 0; i < 64; ++i) freqs[i] = g[i];
+    ni::Buffer bqkv = gpu.alloc(qkv.size() * 4, "cqkv"), bqw = gpu.alloc(qw.size() * 2, "cqw"),
+               bkw = gpu.alloc(kw.size() * 2, "ckw"), bf = gpu.alloc(256, "cf"), bkc = gpu.alloc(kc.size() * 2, "ckc"),
+               bvc = gpu.alloc(vc.size() * 2, "cvc"), bq = gpu.alloc(q.size() * 4, "cq"),
+               bg = gpu.alloc(gate.size() * 4, "cg"), bao = gpu.alloc(ao.size() * 4, "cao");
+    memcpy(bqkv.ptr(), qkv.data(), qkv.size() * 4);
+    memcpy(bqw.ptr(), qw.data(), qw.size() * 2);
+    memcpy(bkw.ptr(), kw.data(), kw.size() * 2);
+    memcpy(bf.ptr(), freqs.data(), 256);
+    memcpy(bg.ptr(), gate.data(), gate.size() * 4);
+    const Lfm3QkParams qp{1, Hq, Hkv, D, cap, pos};
+    auto e = gpu.begin();
+    e->use(gpu.pipeline("lfm3_qk_prep"));
+    e->buf(0, bqkv);
+    e->buf(1, bqw);
+    e->buf(2, bkw);
+    e->buf(3, bf);
+    e->buf(4, bkc);
+    e->buf(5, bvc);
+    e->buf(6, bq);
+    e->val(7, qp);
+    e->dispatch(Hq + 2 * Hkv, 1, 1, 1);
+    e->commit_and_wait();
+    printf("qk_prep ok\n");
+    // the decode GEMM the engine faults on: 4-bit group 32, N=6144, K=2048, M=1 (the conv in_proj's shape)
+    {
+      const uint32_t N = 6144, K = 2048;
+      std::vector<uint32_t> w(size_t(N) * (K / 8));
+      std::vector<uint16_t> sb(size_t(N) * (K / 64));
+      for (auto& v : w) v = lcg(seed);
+      for (auto& v : sb) v = uint16_t(0x3f80);
+      std::vector<float> yout(size_t(N), 0.f);
+      ni::Buffer bw2 = gpu.alloc(w.size() * 4, "gw"), bs2 = gpu.alloc(sb.size() * 2, "gs"),
+                 bb2 = gpu.alloc(sb.size() * 2, "gb"), bx2 = gpu.alloc(xh2.size() * 2, "gx"),
+                 by2 = gpu.alloc(yout.size() * 4, "gy");
+      memcpy(bw2.ptr(), w.data(), w.size() * 4);
+      memcpy(bs2.ptr(), sb.data(), sb.size() * 2);
+      memcpy(bb2.ptr(), sb.data(), sb.size() * 2);
+      memcpy(bx2.ptr(), xh2.data(), xh2.size() * 2);
+      const ni::kp::Qmm p2{1, N, K, K, N, 0, 32, 0, 0};
+      auto e3 = gpu.begin();
+      e3->use(gpu.pipeline("qrf_f4g32_m8_n64"));
+      e3->buf(0, bx2);
+      e3->buf(1, bw2);
+      e3->buf(2, bs2);
+      e3->buf(3, bb2);
+      e3->buf(4, by2);
+      e3->val(5, p2);
+      e3->dispatch((N + 63) / 64, 1, 1, 64);
+      e3->commit_and_wait();
+      ok("decode GEMM: 4-bit group 32 at the in_proj's shape", by2.as<float>()[0] != 0.f);
+    }
+    const Lfm3AttnParams ap{Hq, Hkv, D, cap, pos, 0, 1.f / std::sqrt(float(D))};
+    auto e2 = gpu.begin();
+    e2->use(gpu.pipeline("lfm3_attn_d"));
+    e2->buf(0, bq);
+    e2->buf(1, bkc);
+    e2->buf(2, bvc);
+    e2->buf(3, bg);
+    e2->buf(4, bao);
+    e2->val(5, ap);
+    e2->dispatch(Hq, 1, 1, 1);
+    e2->commit_and_wait();
+    printf("attn_d ok: ao[0]=%g\n", bao.as<float>()[0]);
+    printf("%s (%d ok, %d failed)\n", g_fail ? "FAIL" : "PASS", g_ok, g_fail);
+    return g_fail ? 1 : 0;
+  }
   if (mode != "kernels") {
-    fprintf(stderr, "usage: lfm3_kernel_check kernels | tok DIR TEXT...\n");
+    fprintf(stderr, "usage: lfm3_kernel_check kernels | logits DIR ID... | sample | chain | tok DIR TEXT...\n");
     return 2;
   }
 
   ni::Gpu& gpu = ni::Gpu::get();
+
+  // the in_proj output is [T, 3H] with (B, C, x) inside each row: the gates must read the planes with a
+  // stride, not as three planar [T, H] buffers (a T = 1 decode cannot tell the difference)
+  {
+    const uint32_t T = 5, H = 64;
+    uint32_t seed = 777;
+    std::vector<float> bcx(size_t(T) * 3 * H), z(size_t(T) * H), want_u(size_t(T) * H),
+        want_y(size_t(T) * H);
+    for (auto& v : bcx) v = rnd(seed);
+    for (auto& v : z) v = rnd(seed);
+    for (uint32_t t = 0; t < T; ++t)
+      for (uint32_t c = 0; c < H; ++c) {
+        const size_t row = size_t(t) * 3 * H;
+        want_u[size_t(t) * H + c] = bcx[row + c] * bcx[row + 2 * H + c];
+        want_y[size_t(t) * H + c] = bcx[row + H + c] * z[size_t(t) * H + c];
+      }
+    ni::Buffer b = gpu.alloc(bcx.size() * 4, "bcx"), bz = gpu.alloc(z.size() * 4, "z"),
+               bu = gpu.alloc(want_u.size() * 4, "bu"), by = gpu.alloc(want_y.size() * 4, "by");
+    memcpy(b.ptr(), bcx.data(), bcx.size() * 4);
+    memcpy(bz.ptr(), z.data(), z.size() * 4);
+    for (uint32_t which : {0u, 1u}) {
+      const Lfm3BcxParams p{T, H, which};
+      auto e = gpu.begin();
+      e->use(gpu.pipeline("lfm3_bcx"));
+      e->buf(0, b);
+      e->buf(1, which == 0 ? b : bz);
+      e->buf(2, which == 0 ? bu : by);
+      e->val(3, p);
+      e->dispatch((H + 255) / 256, T, 1, 256);
+      e->commit_and_wait();
+      const float* got = (which == 0 ? bu : by).as<float>();
+      const std::vector<float>& want = which == 0 ? want_u : want_y;
+      bool good = true;
+      for (size_t i = 0; i < want.size(); ++i)
+        if (fabsf(got[i] - want[i]) > 1e-6f * (1.f + fabsf(want[i]))) {
+          good = false;
+          break;
+        }
+      ok(which == 0 ? "bcx: u reads B and x from each row" : "bcx: y reads C from each row times z", good);
+    }
+  }
+
   const uint32_t K = 7;
   for (const uint32_t H : {64u, 512u}) {
     const uint32_t T = 33;

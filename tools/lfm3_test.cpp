@@ -257,11 +257,10 @@ int main() {
     ok("rope: the sliding table rotates every pair", all);
   }
 
-  // what the engine refuses, precisely (src/engine/engine.cpp, unsupported_model): a runnable LFM3 waits for the
-  // backend, and an unsupported setting is refused alone
+  // what the engine refuses, precisely (src/engine/engine.cpp, unsupported_model): a runnable LFM3 runs, and an
+  // unsupported setting is refused alone
   const std::string runnable = ni::unsupported_model(dir);
-  ok("engine: a runnable LFM3 waits for the backend", runnable.find("does not load models in this build yet") != std::string::npos,
-     runnable);
+  ok("engine: a runnable LFM3 runs", runnable.empty(), runnable);
   json bad = cfg;
   bad["conv_L_cache"] = 4;
   const std::string bpath = base + "/engine-bad";
