@@ -376,6 +376,35 @@ void Lfm3::lin(Encoder& e, const Lfm3Lin& W, const Buffer& xh, const Buffer& y, 
   e.dispatch((W.N + bn - 1) / bn, (uint32_t(rows) + bm - 1) / bm, 1, th);
 }
 
+// The decode matvec of one 4-bit group-32 linear: qmvf reads the fp32 x and folds the RMSNorm, so the
+// decode path needs no halfs and no separate norm dispatch for these. The 8-bit group-64 linears keep
+// to_half + qmr8 (their specialized kernel takes halfs).
+void Lfm3::enc_mv1(Encoder& e, const Lfm3Lin& W, const Buffer& x, const Tensor* norm, const Buffer& y,
+                   int rows, uint32_t y_ld) {
+  ni::kp::Qmvf pm{};
+  pm.K = W.K;
+  pm.R = uint32_t(rows);
+  pm.x_ld = W.K;
+  pm.nseg = 1;
+  pm.eps = cfg_.eps;
+  pm.N[0] = W.N;
+  pm.y_ld[0] = y_ld ? y_ld : W.N;
+  pm.add[0] = 0;
+  pm.tg_begin[0] = 0;
+  pm.tg_begin[1] = (W.N + 7) / 8;
+  pm.write_xn = 0;
+  e.use(pipe(norm ? "qmvf_b4g32_t1_r4_norm" : "qmvf_b4g32_t1_r4"));
+  e.buf(0, W.w->buf);
+  e.buf(1, W.s->buf);
+  e.buf(2, W.b->buf);
+  e.buf(3, y);
+  e.buf(16, x);
+  e.val(17, pm);
+  e.buf(18, norm ? norm->buf : x);
+  e.buf(19, x);
+  e.dispatch(uint32_t(rows), (W.N + 7) / 8, 1, 64);
+}
+
 // x's rows through an RMSNorm (norm's weight) into y as halfs; without a norm, plain halfs.
 void Lfm3::to_half(Encoder& e, const Buffer& x, const Tensor* norm, const Buffer& y, int rows, uint32_t d) {
   // d is the row's width: hidden for the mixer's inputs and outputs, intermediate_size for the FFN's
@@ -608,11 +637,17 @@ void Lfm3::encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, ui
   const uint32_t QD = uint32_t(cfg_.hq) * uint32_t(cfg_.hd), KD = uint32_t(cfg_.hkv) * uint32_t(cfg_.hd);
   if (pos + 1 > s.cap && !reserve(s, pos + 1)) fatal("context full (%d)", s.cap);
   embed(e, s.tok, pos, 1, x_);
+  // one decode row: a 4-bit group-32 linear runs qmvf on the fp32 x (the norm folded); an 8-bit one
+  // keeps to_half + qmr8 (xh_ carries half(norm(x) * in_norm) for it)
+  auto mv = [&](const Lfm3Lin& W, const Buffer& xfp, const Tensor* norm, const Buffer& y, uint32_t y_ld) {
+    if (W.bits == 4 && W.gs == 32) enc_mv1(e, W, xfp, norm, y, 1, y_ld);
+    else lin(e, W, xh_, y, 1, false, y_ld);
+  };
   for (int l = 0; l < cfg_.layers; ++l) {
     const Lfm3Layer& L = layers_[size_t(l)];
-    to_half(e, x_, L.in_norm, xh_, 1);  // xh = half(norm(x) * in_norm)
+    to_half(e, x_, L.in_norm, xh_, 1);  // xh = half(norm(x) * in_norm), for the 8-bit linears
     if (L.kind == 'C') {
-      lin(e, L.in_proj, xh_, bcx_, 1, false, 0);
+      mv(L.in_proj, x_, L.in_norm, bcx_, 0);
       // u = B . x over the row's first and third thirds
       e.use(pipe("lfm3_mul"));
       e.buf(0, bcx_);
@@ -635,16 +670,15 @@ void Lfm3::encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, ui
       e.buf(2, ym_);
       e.val(3, H);
       e.dispatch((H + 255) / 256, 1, 1, 256);
-      to_half(e, ym_, nullptr, aoh_, 1);
-      lin(e, L.out_proj, aoh_, mx_, 1, false, 0);
+      mv(L.out_proj, ym_, nullptr, mx_, 0);
     } else {
       const uint32_t row_ld = QD + 2 * KD;
       Buffer qv = qkv_, kv2 = qkv_.view(size_t(QD) * 4, qkv_.size - size_t(QD) * 4),
              vv = qkv_.view(size_t(QD + KD) * 4, qkv_.size - size_t(QD + KD) * 4);
-      lin(e, L.q, xh_, qv, 1, false, row_ld);
-      lin(e, L.k, xh_, kv2, 1, false, row_ld);
-      lin(e, L.v, xh_, vv, 1, false, row_ld);
-      lin(e, L.gate, xh_, gate_, 1, false, 0);
+      mv(L.q, x_, L.in_norm, qv, row_ld);
+      mv(L.k, x_, L.in_norm, kv2, row_ld);
+      mv(L.v, x_, L.in_norm, vv, row_ld);
+      mv(L.gate, x_, L.in_norm, gate_, 0);
       const uint32_t cache_cap = L.kind == 'S' ? uint32_t(cfg_.window + 8 + 7) / 8 * 8 : uint32_t(s.cap);
       const Lfm3QkParams qp{1, uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.hd), cache_cap,
                             uint32_t(pos)};
@@ -677,14 +711,13 @@ void Lfm3::encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, ui
       e.buf(4, ao_);
       e.val(5, ap);
       e.dispatch(uint32_t(cfg_.hq), uint32_t(cfg_.hd), 1, 1);
-      to_half(e, ao_, nullptr, aoh_, 1);
-      lin(e, L.o, aoh_, mx_, 1, false, 0);
+      mv(L.o, ao_, nullptr, mx_, 0);
     }
     res_norm(e, mx_, L.post_norm, x_, x_, 1);
     // the FFN
     to_half(e, x_, L.ffn_norm, xh_, 1);
-    lin(e, L.w1, xh_, g_, 1, false, 0);
-    lin(e, L.w3, xh_, u2_, 1, false, 0);
+    mv(L.w1, x_, L.ffn_norm, g_, 0);
+    mv(L.w3, x_, L.ffn_norm, u2_, 0);
     {
       const uint32_t n = I;
       e.use(pipe("swiglu_f32"));
@@ -694,8 +727,7 @@ void Lfm3::encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, ui
       e.val(3, n);
       e.dispatch((n + 255) / 256, 1, 1, 256);
     }
-    to_half(e, h_, nullptr, hh_, 1, I);
-    lin(e, L.w2, hh_, mx_, 1, false, 0);
+    mv(L.w2, h_, nullptr, mx_, 0);
     res_norm(e, mx_, L.post_ffn_norm, x_, x_, 1);
   }
   if (sample) {
