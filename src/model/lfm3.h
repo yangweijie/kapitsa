@@ -139,7 +139,7 @@ class Lfm3 : public Model {
   size_t mem_budget_ = 0;
   // decode activations (kMaxRows rows)
   Buffer x_, xh_, bcx_, u_, z_, ym_, mx_, aoh_, qkv_, gate_, q_, ao_, g_, u2_, h_, hh_, xn_, logits_,
-      cand_v_, cand_i_, sprob_;
+      cand_v_, cand_i_, sprob_, apart_o_, apart_m_, apart_s_;
   // prefill activations (tmax_ rows)
   Buffer px_, pxh_, pbcx_, pu_, pz_, py_, pmix_, paoh_, pqkv_, pgate_, pq_, pao_, pg_, pu2_, ph_, phh_;
   bool sample_sg_ = false;        // topk_stage1_rows_sg (an Apple10 GPU on macOS 26), as Qwen35 reads it

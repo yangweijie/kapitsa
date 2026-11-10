@@ -39,8 +39,8 @@ struct Lfm3ConvParams {
 struct Lfm3GateParams {
   uint32_t T, Hq, D;
 };
-struct Lfm3AttnParams {
-  uint32_t Hq, Hkv, D, cap, pos, window;
+struct Lfm3AttnSplitParams {
+  uint32_t Hq, Hkv, D, cap, pos, window, splits;
   float scale;
 };
 struct Lfm3QkParams {
@@ -278,16 +278,132 @@ int main(int argc, char** argv) {
       e3->commit_and_wait();
       ok("decode GEMM: 4-bit group 32 at the in_proj's shape", by2.as<float>()[0] != 0.f);
     }
-    const Lfm3AttnParams ap{Hq, Hkv, D, cap, pos, 0, 1.f / std::sqrt(float(D))};
+    // timings: the decode GEMM's two forms (qrf tile vs qmvf matvec) and the attention at a real depth
+    {
+      const uint32_t N = 6144, K = 2048;
+      std::vector<uint32_t> w(size_t(N) * (K / 8));
+      std::vector<uint16_t> sb(size_t(N) * (K / 64));
+      for (auto& v : w) v = lcg(seed);
+      for (auto& v : sb) v = uint16_t(0x3f80);
+      std::vector<float> xf(size_t(H), 0.f), yout(size_t(N), 0.f), nw(size_t(H), 0.f);
+      for (auto& v : xf) v = rnd(seed);
+      for (auto& v : nw) v = rnd(seed);
+      ni::Buffer bw3 = gpu.alloc(w.size() * 4, "tw"), bs3 = gpu.alloc(sb.size() * 2, "ts"),
+                 bb3 = gpu.alloc(sb.size() * 2, "tb"), bx3 = gpu.alloc(xf.size() * 4, "tx"),
+                 by3 = gpu.alloc(yout.size() * 4, "ty"), bnw = gpu.alloc(nw.size() * 2, "tnw");
+      memcpy(bw3.ptr(), w.data(), w.size() * 4);
+      memcpy(bs3.ptr(), sb.data(), sb.size() * 2);
+      memcpy(bb3.ptr(), sb.data(), sb.size() * 2);
+      memcpy(bx3.ptr(), xf.data(), xf.size() * 4);
+      memcpy(bnw.ptr(), to_bf16_span(nw).data(), nw.size() * 2);
+      // warm both
+      for (int rep = 0; rep < 2; ++rep) {
+        const ni::kp::Qmm p2{1, N, K, K, N, 0, 32, 0, 0};
+        auto e3 = gpu.begin();
+        e3->use(gpu.pipeline("qrf_f4g32_m8_n64"));
+        e3->buf(0, bx3);
+        e3->buf(1, bw3);
+        e3->buf(2, bs3);
+        e3->buf(3, bb3);
+        e3->buf(4, by3);
+        e3->val(5, p2);
+        e3->dispatch((N + 63) / 64, 1, 1, 64);
+        e3->commit_and_wait();
+      }
+      double t0 = ni::Encoder::host_ms();
+      for (int rep = 0; rep < 50; ++rep) {
+        const ni::kp::Qmm p2{1, N, K, K, N, 0, 32, 0, 0};
+        auto e3 = gpu.begin();
+        e3->use(gpu.pipeline("qrf_f4g32_m8_n64"));
+        e3->buf(0, bx3);
+        e3->buf(1, bw3);
+        e3->buf(2, bs3);
+        e3->buf(3, bb3);
+        e3->buf(4, by3);
+        e3->val(5, p2);
+        e3->dispatch((N + 63) / 64, 1, 1, 64);
+        e3->commit_and_wait();
+      }
+      const double qrf_ms = (ni::Encoder::host_ms() - t0) / 50;
+      printf("bench: in_proj decode N=6144 K=2048 M=1: qrf_f4g32_m8 %.3f ms/pass\n", qrf_ms);
+      // the attention at a real depth
+      std::vector<float> q2(size_t(Hq * D), 0.f);
+      for (auto& v : q2) v = rnd(seed);
+      memcpy(bq.ptr(), q2.data(), q2.size() * 4);
+      const uint32_t deep = 3000;
+      for (int rep = 0; rep < 2; ++rep) {
+        const Lfm3AttnSplitParams ap2{Hq, Hkv, D, cap, deep, 0, 32, 1.f / std::sqrt(float(D))};
+        ni::Buffer bpO = gpu.alloc(size_t(Hq) * 32 * D * 4, "bpO"), bpM = gpu.alloc(size_t(Hq) * 32 * 4, "bpM"),
+                   bpS = gpu.alloc(size_t(Hq) * 32 * 4, "bpS");
+        auto e4 = gpu.begin();
+        e4->use(gpu.pipeline("lfm3_attn_d_split"));
+        e4->buf(0, bq);
+        e4->buf(1, bkc);
+        e4->buf(2, bvc);
+        e4->buf(3, bpO);
+        e4->buf(4, bpM);
+        e4->buf(5, bpS);
+        e4->val(6, ap2);
+        e4->dispatch(Hq, 32, 1, 1);
+        e4->use(gpu.pipeline("lfm3_attn_d_merge"));
+        e4->buf(0, bpO);
+        e4->buf(1, bpM);
+        e4->buf(2, bpS);
+        e4->buf(3, bg);
+        e4->buf(4, bao);
+        e4->val(5, ap2);
+        e4->dispatch(Hq, D, 1, 1);
+        e4->commit_and_wait();
+      }
+      t0 = ni::Encoder::host_ms();
+      const int reps = 20;
+      for (int rep = 0; rep < reps; ++rep) {
+        const Lfm3AttnSplitParams ap2{Hq, Hkv, D, cap, deep, 0, 32, 1.f / std::sqrt(float(D))};
+        ni::Buffer bpO = gpu.alloc(size_t(Hq) * 32 * D * 4, "bpO"), bpM = gpu.alloc(size_t(Hq) * 32 * 4, "bpM"),
+                   bpS = gpu.alloc(size_t(Hq) * 32 * 4, "bpS");
+        auto e4 = gpu.begin();
+        e4->use(gpu.pipeline("lfm3_attn_d_split"));
+        e4->buf(0, bq);
+        e4->buf(1, bkc);
+        e4->buf(2, bvc);
+        e4->buf(3, bpO);
+        e4->buf(4, bpM);
+        e4->buf(5, bpS);
+        e4->val(6, ap2);
+        e4->dispatch(Hq, 32, 1, 1);
+        e4->use(gpu.pipeline("lfm3_attn_d_merge"));
+        e4->buf(0, bpO);
+        e4->buf(1, bpM);
+        e4->buf(2, bpS);
+        e4->buf(3, bg);
+        e4->buf(4, bao);
+        e4->val(5, ap2);
+        e4->dispatch(Hq, D, 1, 1);
+        e4->commit_and_wait();
+      }
+      printf("bench: attn_d pos=3000 Hq=16: %.3f ms/pass\n", (ni::Encoder::host_ms() - t0) / reps);
+    }
+    const Lfm3AttnSplitParams ap{Hq, Hkv, D, cap, pos, 0, 32, 1.f / std::sqrt(float(D))};
+    ni::Buffer bpO2 = gpu.alloc(size_t(Hq) * 32 * D * 4, "cpO"), bpM2 = gpu.alloc(size_t(Hq) * 32 * 4, "cpM"),
+               bpS2 = gpu.alloc(size_t(Hq) * 32 * 4, "cpS");
     auto e2 = gpu.begin();
-    e2->use(gpu.pipeline("lfm3_attn_d"));
+    e2->use(gpu.pipeline("lfm3_attn_d_split"));
     e2->buf(0, bq);
     e2->buf(1, bkc);
     e2->buf(2, bvc);
+    e2->buf(3, bpO2);
+    e2->buf(4, bpM2);
+    e2->buf(5, bpS2);
+    e2->val(6, ap);
+    e2->dispatch(Hq, 32, 1, 1);
+    e2->use(gpu.pipeline("lfm3_attn_d_merge"));
+    e2->buf(0, bpO2);
+    e2->buf(1, bpM2);
+    e2->buf(2, bpS2);
     e2->buf(3, bg);
     e2->buf(4, bao);
     e2->val(5, ap);
-    e2->dispatch(Hq, 1, 1, 1);
+    e2->dispatch(Hq, D, 1, 1);
     e2->commit_and_wait();
     printf("attn_d ok: ao[0]=%g\n", bao.as<float>()[0]);
     printf("%s (%d ok, %d failed)\n", g_fail ? "FAIL" : "PASS", g_ok, g_fail);
@@ -495,16 +611,27 @@ int main(int argc, char** argv) {
       memcpy(bg.ptr(), gate.data(), gate.size() * 4);
       for (const uint32_t window : {0u, 8u}) {
         for (const uint32_t pos : {0u, 17u, 55u, 63u}) {
-          Lfm3AttnParams p{Hq, Hkv, D, cap, pos, window, scale};
+          Lfm3AttnSplitParams p{Hq, Hkv, D, cap, pos, window, 32, scale};
+          ni::Buffer bpO = gpu.alloc(size_t(Hq) * 32 * D * 4, "xpO"), bpM = gpu.alloc(size_t(Hq) * 32 * 4, "xpM"),
+                     bpS = gpu.alloc(size_t(Hq) * 32 * 4, "xpS");
           auto e = gpu.begin();
-          e->use(gpu.pipeline("lfm3_attn_d"));
+          e->use(gpu.pipeline("lfm3_attn_d_split"));
           e->buf(0, bq);
           e->buf(1, bkc);
           e->buf(2, bvc);
+          e->buf(3, bpO);
+          e->buf(4, bpM);
+          e->buf(5, bpS);
+          e->val(6, p);
+          e->dispatch(Hq, 32, 1, 1);
+          e->use(gpu.pipeline("lfm3_attn_d_merge"));
+          e->buf(0, bpO);
+          e->buf(1, bpM);
+          e->buf(2, bpS);
           e->buf(3, bg);
           e->buf(4, bo);
           e->val(5, p);
-          e->dispatch(Hq, 1, 1, 1);
+          e->dispatch(Hq, D, 1, 1);
           e->commit_and_wait();
           // the reference
           const uint32_t beg = window && pos >= window ? pos + 1 - window : 0;
