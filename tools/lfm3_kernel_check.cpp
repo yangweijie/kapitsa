@@ -107,6 +107,8 @@ int main(int argc, char** argv) {
     if (argc < 4) return 2;
     std::vector<int> ids;
     for (int i = 3; i < argc; ++i) ids.push_back(atoi(argv[i]));
+    ni::Gpu::get().compile();
+    ni::Gpu::get().compile_formats();  // (the qrf_f4g32 family lives in the second library: compile it before the encoder)
     ni::Lfm3 m(argv[2], 2048);
     auto s = m.new_seq(8192);
     memcpy(s->tok.as<int>(), ids.data(), ids.size() * 4);

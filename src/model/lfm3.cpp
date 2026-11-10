@@ -329,6 +329,9 @@ void Lfm3::load() {
   pu2_ = g.alloc(T * i * 4, "lfm3_pu2");
   ph_ = g.alloc(T * i * 4, "lfm3_ph");
   phh_ = g.alloc(T * i * 2, "lfm3_phh");
+  // the file's formats (4-bit group 32) run on wfmt.metal's second library: compiled here, at load, so the
+  // first prefill's encoder never waits on a library compile mid-pass
+  g.compile_formats();
 }
 
 Pipeline Lfm3::pipe(const std::string& n) {
