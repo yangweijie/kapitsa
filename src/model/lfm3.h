@@ -120,6 +120,10 @@ class Lfm3 : public Model {
   void load();
   Pipeline pipe(const std::string& n);
   void lin(Encoder& e, const Lfm3Lin& W, const Buffer& xh, const Buffer& y, int rows, bool add, uint32_t y_ld);
+  // The decode matvec (rows <= kMaxRows) of a 4-bit group-32 linear: qmvf_b4g32_t1_r4[_norm] reads the
+  // fp32 x directly and folds the RMSNorm (norm non-null) — no halfs, no separate norm dispatch.
+  void enc_mv1(Encoder& e, const Lfm3Lin& W, const Buffer& x, const Tensor* norm, const Buffer& y, int rows,
+               uint32_t y_ld = 0);
   void to_half(Encoder& e, const Buffer& x, const Tensor* norm, const Buffer& y, int rows, uint32_t d = 0);
   void res_norm(Encoder& e, const Buffer& z, const Tensor* w, const Buffer& x, const Buffer& out, int rows);
   void embed(Encoder& e, const Buffer& tokens, int tok_off, int rows, const Buffer& out);
