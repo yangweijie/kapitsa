@@ -49,6 +49,7 @@
 #include "model/dory.h"
 #include "model/flint.h"
 #include "model/kflash_budget.h"
+#include "model/lfm3.h"
 #include "model/nemotron_h.h"
 #include "model/qwen35.h"
 #include "model/qwen4_exp.h"
@@ -238,6 +239,7 @@ int main(int argc, char** argv) {
     if (!loop_kv.empty() && !parse_loop_kv(loop_kv, &kv)) fatal("--loop-kv: last-loop or per-loop");
     const char* has = Qwen4Exp::is_model(dir) || Flint::is_model(dir) ? "step,verify"
                       : Dory::is_model(dir) ? (kv == LoopKv::per_loop ? "step,verify" : "step")
+                      : Lfm3::is_model(dir) ? "step"
                                             : "step,verify,batch";
     printf("%s\n", has);
     return 0;
@@ -288,6 +290,7 @@ int main(int argc, char** argv) {
   NemotronH* nh = nullptr;
   Dory* dory = nullptr;
   Flint* fl = nullptr;
+  Lfm3* l3 = nullptr;
   if (Qwen4Exp::is_model(dir)) {
     // the default memory budget, not the engine's (which sets its slots' state and KV apart): a Q2_0 pack's expert
     // store, and so which routed experts stream, may differ from a served model's (NI_EXPERT_STORE pins it). The
@@ -310,6 +313,10 @@ int main(int argc, char** argv) {
     auto m = std::make_unique<NemotronH>(dir, chunk);
     nh = m.get();
     model = std::move(m);
+  } else if (Lfm3::is_model(dir)) {
+    auto m = std::make_unique<Lfm3>(dir, chunk);
+    l3 = m.get();
+    model = std::move(m);
   } else {
     auto m = std::make_unique<Qwen35>(dir, chunk);
     q = m.get();
@@ -318,7 +325,7 @@ int main(int argc, char** argv) {
   Model& m = *model;
   const int V = m.vocab();
   auto logits = [&]() -> const float* {
-    return q ? q->logits() : nh ? nh->logits() : fl ? fl->logits() : dory->logits();
+    return l3 ? l3->logits_for_debug() : q ? q->logits() : nh ? nh->logits() : fl ? fl->logits() : dory->logits();
   };
   auto begin_pass = [&] { return m.grouped_passes() ? g.begin_grouped() : g.begin(); };
   const SamplingParams sp;  // greedy: no pass samples a token the next row reads
