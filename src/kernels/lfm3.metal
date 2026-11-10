@@ -159,6 +159,61 @@ struct Lfm3AttnParams {
   float scale; // 1 / sqrt(D)
 };
 
+struct Lfm3AttnPParams {
+  uint T;      // query rows this pass encodes
+  uint Hq;
+  uint Hkv;
+  uint D;
+  uint cap;
+  uint pos0;   // the first row's position
+  uint window;
+  float scale;
+};
+[[kernel]] void lfm3_attn_p(const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]],
+                            const device half* vc [[buffer(2)]], const device float* gate [[buffer(3)]],
+                            device float* out [[buffer(4)]], constant Lfm3AttnPParams& p [[buffer(5)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+  const uint h = gid.x, t = gid.y;
+  if (h >= p.Hq || t >= p.T) return;
+  const uint pos = p.pos0 + t;
+  const device half* kkh = kc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
+  const device half* vvh = vc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
+  const uint beg = p.window && pos >= p.window ? pos + 1 - p.window : 0;
+  const device float* qh = q + (uint64_t(t) * p.Hq + h) * p.D;
+  float m = -1e30f;
+  for (uint s = beg; s <= pos; ++s) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s % p.cap) * p.D + d]);
+    m = s == beg ? score * p.scale : max(m, score * p.scale);
+  }
+  float denom = 0;
+  for (uint s = beg; s <= pos; ++s) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s % p.cap) * p.D + d]);
+    denom += metal::precise::exp(score * p.scale - m);
+  }
+  device float* oh = out + (uint64_t(t) * p.Hq + h) * p.D;
+  for (uint d = 0; d < p.D; ++d) oh[d] = 0;
+  for (uint s = beg; s <= pos; ++s) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s % p.cap) * p.D + d]);
+    const float wgt = metal::precise::exp(score * p.scale - m) / denom;
+    for (uint d = 0; d < p.D; ++d) oh[d] += wgt * float(vvh[uint64_t(s % p.cap) * p.D + d]);
+  }
+  const float g = sigmoid(gate[uint(t) * p.Hq + h]);
+  for (uint d = 0; d < p.D; ++d) oh[d] *= g;
+}
+
+
+// The conv ring after a prefill chunk: the last K-1 frames of u, oldest first.
+[[kernel]] void lfm3_ring_roll(const device float* u [[buffer(0)]], device bfloat* ring [[buffer(1)]],
+                               constant Lfm3ConvParams& p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  const uint c = gid;
+  if (c >= p.H) return;
+  for (uint j = 0; j + 1 < p.K; ++j)
+    ring[j * p.H + c] = bfloat(u[uint64_t(p.T - (p.K - 1) + j) * p.H + c]);
+}
+
 // Plain decode attention at head dim 128, split over the positions: kernel 1 gives each (head, split) a
 // contiguous chunk of the causal range and writes its partial output, running max and sum; kernel 2 merges
 // the splits (the online-softmax merge) and applies the per-head sigmoid gate. SPLITS = the grid's y (the
