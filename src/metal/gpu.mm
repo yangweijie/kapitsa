@@ -916,6 +916,7 @@ void Encoder::profile_report(int steps) {
   prof_recs().clear();
 }
 void Encoder::buf(int idx, const Buffer& b, size_t extra) {
+  if (!b.mtl) fatal("binding a null buffer at slot %d (dispatch %s)", idx, cur_name_);
   if (rec_) return rec_set(0, idx, b.mtl, b.offset + extra, 0);
   [E(enc_) setBuffer:(__bridge id<MTLBuffer>)b.mtl offset:b.offset + extra atIndex:idx];
 }
@@ -964,7 +965,14 @@ void Encoder::pre_dispatch() {
   dispatched_ = true;
 }
 
+// NI_CB_LABEL=1: every command buffer takes its latest dispatch's name, so a failed CB says what it held.
+static bool cb_labels() {
+  static const bool on = getenv("NI_CB_LABEL") && atoi(getenv("NI_CB_LABEL")) != 0;
+  return on;
+}
+
 void Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uint32_t tz) {
+    if (cb_labels() && cb_) [( __bridge id<MTLCommandBuffer>)cb_ setLabel: @(cur_name_)];
   fit_threads(tx * ty * tz);
   if (rec_) {
     const uint32_t g[3] = {gx, gy, gz}, t[3] = {tx, ty, tz};
@@ -972,6 +980,7 @@ void Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint3
   }
   pre_dispatch();
   [E(enc_) dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+  if (cb_labels() && cb_) [( __bridge id<MTLCommandBuffer>)cb_ setLabel: @(cur_name_)];  // (after pre_dispatch's possible split)
   if (dup_kernel(cur_name_))
     [E(enc_) dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
   if (profiling()) {
@@ -1216,10 +1225,13 @@ void Encoder::wait() {
   for (void* p : prev_) {
     id<MTLCommandBuffer> b = (__bridge id<MTLCommandBuffer>)p;
     [b waitUntilCompleted];
-    if (b.status == MTLCommandBufferStatusError) fatal("GPU error: %s", [[b.error description] UTF8String]);
+    if (b.status == MTLCommandBufferStatusError)
+      fatal("GPU error in CB \"%s\": %s", b.label ? [b.label UTF8String] : "(set NI_CB_LABEL=1)",
+            [[b.error description] UTF8String]);
   }
   if (cb.status == MTLCommandBufferStatusError)
-    fatal("GPU error: %s", [[cb.error description] UTF8String]);
+    fatal("GPU error in CB \"%s\": %s", cb.label ? [cb.label UTF8String] : "(set NI_CB_LABEL=1)",
+          [[cb.error description] UTF8String]);
   static const bool cbt = getenv("NI_CB_TRACE") && atoi(getenv("NI_CB_TRACE"));
   if (cbt && prev_.size() > 4) {
     // debug: GPU time of each command buffer of this encoder, the idle gaps between them
