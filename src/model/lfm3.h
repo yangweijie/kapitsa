@@ -147,6 +147,7 @@ class Lfm3 : public Model {
       cand_v_, cand_i_, sprob_, apart_o_, apart_m_, apart_s_;
   // prefill activations (tmax_ rows)
   Buffer px_, pxh_, pbcx_, pu_, pz_, py_, pmix_, paoh_, pqkv_, pgate_, pq_, pao_, pg_, pu2_, ph_, phh_;
+  Buffer ppart_o_, ppart_m_, ppart_s_;  // the prefill attention's split partials
   bool sample_sg_ = false;        // topk_stage1_rows_sg (an Apple10 GPU on macOS 26), as Qwen35 reads it
 };
 

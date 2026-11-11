@@ -54,6 +54,10 @@ struct Lfm3AttnPParams {
   uint32_t T, Hq, Hkv, D, cap, pos0, window;
   float scale;
 };
+struct Lfm3AttnPSplitParams {
+  uint32_t T, Hq, Hkv, D, cap, pos0, window, splits;
+  float scale;
+};
 struct Lfm3BcxParams {
   uint32_t T, H, which;
 };
@@ -481,6 +485,46 @@ int main(int argc, char** argv) {
       const int reps = 20;
       for (int rep = 0; rep < reps; ++rep) run();
       printf("bench: attn_p T=897 window=256 Hq=16: %.3f ms/pass\n", (ni::Encoder::host_ms() - t0) / reps);
+    }
+    // the split form at the same shape (8 window splits, the engine's prefill setting)
+    {
+      const uint32_t T = 897, win = 256, splits = 8;
+      std::vector<float> qq(size_t(T) * Hq * D), gg(size_t(T) * Hq);
+      for (auto& v : qq) v = rnd(seed);
+      for (auto& v : gg) v = rnd(seed);
+      ni::Buffer bqq = gpu.alloc(qq.size() * 4, "sqq"), bgg = gpu.alloc(gg.size() * 4, "sgg2"),
+                 boo = gpu.alloc(qq.size() * 4, "soo"), bpo = gpu.alloc(size_t(T) * Hq * splits * D * 4, "spo"),
+                 bpm = gpu.alloc(size_t(T) * Hq * splits * 4, "spm"), bps = gpu.alloc(size_t(T) * Hq * splits * 4, "sps");
+      memcpy(bqq.ptr(), qq.data(), qq.size() * 4);
+      memcpy(bgg.ptr(), gg.data(), gg.size() * 4);
+      const Lfm3AttnPSplitParams app{T, Hq, Hkv, D, cap, 0, win, splits, 1.f / std::sqrt(float(D))};
+      auto run = [&] {
+        auto e6 = gpu.begin();
+        e6->use(gpu.pipeline("lfm3_attn_p_split"));
+        e6->buf(0, bqq);
+        e6->buf(1, bkc);
+        e6->buf(2, bvc);
+        e6->buf(3, bpo);
+        e6->buf(4, bpm);
+        e6->buf(5, bps);
+        e6->val(6, app);
+        e6->dispatch(Hq * splits, T, 1, 64);
+        e6->use(gpu.pipeline("lfm3_attn_p_merge"));
+        e6->buf(0, bpo);
+        e6->buf(1, bpm);
+        e6->buf(2, bps);
+        e6->buf(3, bgg);
+        e6->buf(4, boo);
+        e6->val(5, app);
+        e6->dispatch(Hq * D, T, 1, 64);
+        e6->commit_and_wait();
+      };
+      run();
+      double t0 = ni::Encoder::host_ms();
+      const int reps = 20;
+      for (int rep = 0; rep < reps; ++rep) run();
+      printf("bench: attn_p split T=897 window=256 Hq=16 x8: %.3f ms/pass\n",
+             (ni::Encoder::host_ms() - t0) / reps);
     }
     const Lfm3AttnSplitParams ap{Hq, Hkv, D, cap, pos, 0, 32, 1.f / std::sqrt(float(D))};
     ni::Buffer bpO2 = gpu.alloc(size_t(Hq) * 32 * D * 4, "cpO"), bpM2 = gpu.alloc(size_t(Hq) * 32 * 4, "cpM"),
@@ -1097,6 +1141,68 @@ int main(int argc, char** argv) {
       }
     }
     ok("attn_p: the prefill attention with the window and the gate", good);
+    // the split form against the same double reference (a different reduction order, so the tolerance
+    // is the check's own; the serial kernel above is the reference's sibling)
+    {
+      const uint32_t splits = 8;
+      std::vector<float> out2(size_t(T * Hq * D), 0.f);
+      ni::Buffer bo2 = gpu.alloc(out2.size() * 4, "fpout2"),
+                 bpo = gpu.alloc(size_t(T) * Hq * splits * D * 4, "fppo"),
+                 bpm = gpu.alloc(size_t(T) * Hq * splits * 4, "fppm"),
+                 bps = gpu.alloc(size_t(T) * Hq * splits * 4, "fpps");
+      const Lfm3AttnPSplitParams aps{T, Hq, Hkv, D, cap, pos0, window, splits, scale};
+      auto e2 = gpu.begin();
+      e2->use(gpu.pipeline("lfm3_attn_p_split"));
+      e2->buf(0, bq);
+      e2->buf(1, bkc);
+      e2->buf(2, bvc);
+      e2->buf(3, bpo);
+      e2->buf(4, bpm);
+      e2->buf(5, bps);
+      e2->val(6, aps);
+      e2->dispatch(Hq * splits, T, 1, 64);
+      e2->use(gpu.pipeline("lfm3_attn_p_merge"));
+      e2->buf(0, bpo);
+      e2->buf(1, bpm);
+      e2->buf(2, bps);
+      e2->buf(3, bg);
+      e2->buf(4, bo2);
+      e2->val(5, aps);
+      e2->dispatch(Hq * D, T, 1, 64);
+      e2->commit_and_wait();
+      bool good2 = true;
+      for (uint32_t t = 0; t < T && good2; ++t) {
+        const uint32_t pos = pos0 + t, beg = pos >= window ? pos + 1 - window : 0;
+        for (uint32_t h = 0; h < Hq && good2; ++h) {
+          const _Float16* kkh = kc.data() + uint64_t(h / (Hq / Hkv)) * cap * D;
+          const _Float16* vvh = vc.data() + uint64_t(h / (Hq / Hkv)) * cap * D;
+          double mx = -1e300;
+          std::vector<double> sc(size_t(pos - beg + 1));
+          for (uint32_t s = beg; s <= pos; ++s) {
+            double acc = 0;
+            for (uint32_t d = 0; d < D; ++d)
+              acc += double(q[(size_t(t) * Hq + h) * D + d]) * double(kkh[uint64_t(s) * D + d]);
+            sc[size_t(s - beg)] = acc * scale;
+            mx = std::max(mx, sc[size_t(s - beg)]);
+          }
+          double den = 0;
+          for (double v : sc) den += std::exp(v - mx);
+          for (uint32_t d = 0; d < D; ++d) {
+            double acc = 0;
+            for (uint32_t s = beg; s <= pos; ++s)
+              acc += std::exp(sc[size_t(s - beg)] - mx) / den * double(vvh[uint64_t(s) * D + d]);
+            const float want = float(acc * (1.0 / (1.0 + std::exp(-double(gate[size_t(t) * Hq + h])))));
+            const float got = bo2.as<float>()[(size_t(t) * Hq + h) * D + d];
+            if (fabsf(got - want) > 2e-3f * (1.f + fabsf(want))) {
+              fprintf(stderr, "  attn_p split diff t%u h%u d%u: %g vs %g\n", t, h, d, got, want);
+              good2 = false;
+              break;
+            }
+          }
+        }
+      }
+      ok("attn_p split: the split + merge form against the double reference", good2);
+    }
     // the ring roll
     {
       const uint32_t H2 = 128, K2 = 7, T2 = 20;

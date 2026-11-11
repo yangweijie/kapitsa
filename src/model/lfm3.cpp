@@ -189,6 +189,7 @@ struct Lfm3AttnSplitParams {
   float scale;
 };
 static constexpr uint32_t kAttnSplits = 32;
+static constexpr uint32_t kPSplits = 8;  // the prefill attention's window splits
 // LFM3_X_PROBE's per-layer residual rows (the layerwise bisect for the run-to-run wobble)
 static std::vector<Buffer>& xprobe_state() {
   static std::vector<Buffer> v;
@@ -217,6 +218,10 @@ struct Lfm3QkParams {
 };
 struct Lfm3AttnParams {
   uint32_t Hq, Hkv, D, cap, pos, window;
+  float scale;
+};
+struct Lfm3AttnPSplitParams {
+  uint32_t T, Hq, Hkv, D, cap, pos0, window, splits;
   float scale;
 };
 struct Lfm3AttnPParams {
@@ -354,6 +359,9 @@ void Lfm3::load() {
   pu2_ = g.alloc(T * i * 4, "lfm3_pu2");
   ph_ = g.alloc(T * i * 4, "lfm3_ph");
   phh_ = g.alloc(T * i * 2, "lfm3_phh");
+  ppart_o_ = g.alloc(T * size_t(cfg_.hq) * kPSplits * size_t(cfg_.hd) * 4, "lfm3_ppart_o");
+  ppart_m_ = g.alloc(T * size_t(cfg_.hq) * kPSplits * 4, "lfm3_ppart_m");
+  ppart_s_ = g.alloc(T * size_t(cfg_.hq) * kPSplits * 4, "lfm3_ppart_s");
   // the file's formats (4-bit group 32) run on wfmt.metal's second library: compiled here, at load, so the
   // first prefill's encoder never waits on a library compile mid-pass
   g.compile_formats();
@@ -859,16 +867,26 @@ void Lfm3::encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingPar
       e.buf(6, pq_);
       e.val(7, qp);
       e.dispatch(uint32_t(cfg_.hq) + 2 * uint32_t(cfg_.hkv), uint32_t(T), 1, 1);
-      const Lfm3AttnPParams ap{uint32_t(T), uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.hd), cache_cap,
-                               uint32_t(pos0), window_of(l), 1.f / std::sqrt(float(cfg_.hd))};
-      e.use(pipe("lfm3_attn_p"));
+      const Lfm3AttnPSplitParams aps{uint32_t(T),       uint32_t(cfg_.hq), uint32_t(cfg_.hkv),
+                                     uint32_t(cfg_.hd), cache_cap,         uint32_t(pos0),
+                                     window_of(l),      kPSplits,          1.f / std::sqrt(float(cfg_.hd))};
+      e.use(pipe("lfm3_attn_p_split"));
       e.buf(0, pq_);
       e.buf(1, s.kc[size_t(l)]);
       e.buf(2, s.vc[size_t(l)]);
+      e.buf(3, ppart_o_);
+      e.buf(4, ppart_m_);
+      e.buf(5, ppart_s_);
+      e.val(6, aps);
+      e.dispatch(uint32_t(cfg_.hq) * kPSplits, uint32_t(T), 1, 64);
+      e.use(pipe("lfm3_attn_p_merge"));
+      e.buf(0, ppart_o_);
+      e.buf(1, ppart_m_);
+      e.buf(2, ppart_s_);
       e.buf(3, pgate_);
       e.buf(4, pao_);
-      e.val(5, ap);
-      e.dispatch(uint32_t(cfg_.hq), uint32_t(T), 1, 1);
+      e.val(5, aps);
+      e.dispatch(uint32_t(cfg_.hq) * uint32_t(cfg_.hd), uint32_t(T), 1, 64);
       to_half(e, pao_, nullptr, paoh_, T);
       lin(e, L.o, paoh_, pmix_, T, false, 0);
     }
