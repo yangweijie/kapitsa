@@ -394,10 +394,14 @@ void Lfm3::enc_mv1(Encoder& e, const Lfm3Lin& W, const Buffer& x, const Tensor* 
   pm.tg_begin[1] = (W.N + 7) / 8;
   pm.write_xn = 0;
   e.use(pipe(norm ? "qmvf_b4g32_t1_r4_norm" : "qmvf_b4g32_t1_r4"));
-  e.buf(0, W.w->buf);
-  e.buf(1, W.s->buf);
-  e.buf(2, W.b->buf);
-  e.buf(3, y);
+  // the qmvf family declares four segments' buffers (slots 0-15): all bound, the unused segments
+  // repeating segment 0's (the kernel writes only the nseg=1 segment's rows)
+  for (int seg = 0; seg < 4; ++seg) {
+    e.buf(seg * 4 + 0, W.w->buf);
+    e.buf(seg * 4 + 1, W.s->buf);
+    e.buf(seg * 4 + 2, W.b->buf);
+    e.buf(seg * 4 + 3, y);
+  }
   e.buf(16, x);
   e.val(17, pm);
   e.buf(18, norm ? norm->buf : x);
