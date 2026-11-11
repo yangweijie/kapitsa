@@ -43,4 +43,26 @@ struct Lfm3 {
   static size_t conv_state_bytes(const Lfm3Config& c);
 };
 
+// LFM3's zero-tail RoPE inverse frequencies (modeling_lfm3.py's compute_default_rope_parameters): the first
+// int(partial * head_dim) / 2 frequencies follow the full head's progression (theta^(-2i / head_dim)) and the
+// rest are zero. Pairs are (i, i + head_dim / 2) over the WHOLE head — not Qwen's prefix pairing over the
+// rotated dims — so a zero frequency leaves its pair unrotated and the tail dims pass through.
+std::vector<float> lfm3_rope_freqs(double theta, double partial, int head_dim);
+
+// The gated short convolution's causal depthwise pass, as the CPU reference the Metal kernels are diffed
+// against (the moe_exl3.h pattern): y[t][c] = sum_k w[c][k] * u[t - (k_size - 1 - k)], where u before the
+// sequence comes from `state` — the ring of k_size - 1 previous frames, oldest first — or 0 when state is
+// null. u and y are [T, C] rows; w is [C, k_size]; everything fp32. Decoding is this at T = 1 with the ring
+// the caller rolls (its new frames are the last k_size - 1 of state ++ u); the reference and the decode
+// stepping must agree with one prefill, which tools/lfm3_test.cpp pins.
+void lfm3_conv_ref(const float* u, int t_count, int channels, int k_size, const float* w, const float* state,
+                   float* y);
+
+// The zero-tail RoPE applied to one q or k row, as the CPU reference the attention kernels are diffed
+// against: pair (i, i + head_dim / 2) of the row rotates by pos * freqs[i] (x[i]' = x[i] cos - x[i + d/2] sin,
+// x[i + d/2]' = x[i + d/2] cos + x[i] sin), so the table's zero tail (lfm3_rope_freqs) leaves the pairs it
+// covers — dims [d/4, d/2) and [3d/4, d) — unrotated, while the rotated pairs keep the full head's frequency
+// progression. x and out are [head_dim] fp32 rows; out may alias x.
+void lfm3_rope_ref(const float* x, int head_dim, const float* freqs, double pos, float* out);
+
 }  // namespace ni

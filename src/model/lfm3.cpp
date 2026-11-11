@@ -135,4 +135,40 @@ MemPlan Lfm3::plan(const std::string& path, int prefill_chunk) {
   return m;
 }
 
+std::vector<float> lfm3_rope_freqs(const double theta, const double partial, const int head_dim) {
+  const int angles = int(partial * double(head_dim)) / 2;
+  std::vector<float> f(size_t(head_dim / 2), 0.f);
+  for (int i = 0; i < angles && i < head_dim / 2; ++i)
+    f[size_t(i)] = float(std::pow(theta, -2.0 * i / double(head_dim)));
+  return f;
+}
+
+void lfm3_rope_ref(const float* x, const int head_dim, const float* freqs, const double pos, float* out) {
+  const int pairs = head_dim / 2;
+  float tmp[512];
+  float* o = head_dim <= 512 ? tmp : new float[size_t(head_dim)];
+  for (int i = 0; i < pairs; ++i) {
+    const double angle = pos * double(freqs[i]), c = std::cos(angle), s = std::sin(angle);
+    o[i] = float(double(x[i]) * c - double(x[pairs + i]) * s);
+    o[pairs + i] = float(double(x[pairs + i]) * c + double(x[i]) * s);
+  }
+  for (int i = 0; i < head_dim; ++i) out[i] = o[i];
+  if (o != tmp) delete[] o;
+}
+
+void lfm3_conv_ref(const float* u, const int t_count, const int channels, const int k_size, const float* w,
+                   const float* state, float* y) {
+  for (int t = 0; t < t_count; ++t)
+    for (int c = 0; c < channels; ++c) {
+      double acc = 0;
+      for (int k = 0; k < k_size; ++k) {
+        const long long src = int64_t(t) - (k_size - 1 - k);  // the frame this tap reads
+        const float x = src >= 0 ? u[size_t(src) * channels + c]
+                                 : state ? state[size_t(k_size - 1 + src) * channels + c] : 0.f;
+        acc += double(w[size_t(c) * k_size + k]) * double(x);
+      }
+      y[size_t(t) * channels + c] = float(acc);
+    }
+}
+
 }  // namespace ni

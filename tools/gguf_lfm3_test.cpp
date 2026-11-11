@@ -247,8 +247,16 @@ std::string make_gguf(const std::string& dir, const std::string& name, const Spe
 }
 
 std::string sandbox() {
+  // The import keeps 6 GB free on its disk; a full TMPDIR volume sends the sandbox to the repo's disk.
+  std::string base;
+  auto fits = [](const std::string& d) {
+    std::error_code ec;
+    const auto sp = std::filesystem::space(d, ec);
+    return !ec && sp.free > 8ull << 30;
+  };
   const char* tmp = getenv("TMPDIR");
-  std::string base = std::string(tmp && *tmp ? tmp : "/tmp") + "/kapitsa_gguf_lfm3_test";
+  if (tmp && *tmp && fits(tmp)) base = std::string(tmp) + "/kapitsa_gguf_lfm3_test";
+  else base = std::filesystem::current_path().string() + "/.lfm3-sandbox";
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base + "/home");
   setenv("KAPITSA_HOME", (base + "/home").c_str(), 1);
