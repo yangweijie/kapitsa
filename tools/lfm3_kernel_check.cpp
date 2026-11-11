@@ -452,6 +452,36 @@ int main(int argc, char** argv) {
       }
       printf("bench: attn_d pos=3000 Hq=16: %.3f ms/pass\n", (ni::Encoder::host_ms() - t0) / reps);
     }
+    // the prefill attention at a real chunk's shape: T = 897 rows (the corpus window's L0), a sliding
+    // window of 256 over the 264-slot ring — the untiled serial form's baseline for the tiling work
+    {
+      const uint32_t T = 897, win = 256;
+      std::vector<float> qq(size_t(T) * Hq * D), gg(size_t(T) * Hq);
+      for (auto& v : qq) v = rnd(seed);
+      for (auto& v : gg) v = rnd(seed);
+      ni::Buffer bqq = gpu.alloc(qq.size() * 4, "pqq"), bgg = gpu.alloc(gg.size() * 4, "pgg2"),
+                 boo = gpu.alloc(qq.size() * 4, "poo");
+      memcpy(bqq.ptr(), qq.data(), qq.size() * 4);
+      memcpy(bgg.ptr(), gg.data(), gg.size() * 4);
+      const Lfm3AttnPParams app{T, Hq, Hkv, D, cap, 0, win, 1.f / std::sqrt(float(D))};
+      auto run = [&] {
+        auto e6 = gpu.begin();
+        e6->use(gpu.pipeline("lfm3_attn_p"));
+        e6->buf(0, bqq);
+        e6->buf(1, bkc);
+        e6->buf(2, bvc);
+        e6->buf(3, bgg);
+        e6->buf(4, boo);
+        e6->val(5, app);
+        e6->dispatch(Hq, T, 1, 1);
+        e6->commit_and_wait();
+      };
+      run();
+      double t0 = ni::Encoder::host_ms();
+      const int reps = 20;
+      for (int rep = 0; rep < reps; ++rep) run();
+      printf("bench: attn_p T=897 window=256 Hq=16: %.3f ms/pass\n", (ni::Encoder::host_ms() - t0) / reps);
+    }
     const Lfm3AttnSplitParams ap{Hq, Hkv, D, cap, pos, 0, 32, 1.f / std::sqrt(float(D))};
     ni::Buffer bpO2 = gpu.alloc(size_t(Hq) * 32 * D * 4, "cpO"), bpM2 = gpu.alloc(size_t(Hq) * 32 * 4, "cpM"),
                bpS2 = gpu.alloc(size_t(Hq) * 32 * 4, "cpS");
