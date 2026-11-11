@@ -205,13 +205,21 @@ struct Lfm3AttnPParams {
 }
 
 
-// The conv ring after a prefill chunk: the last K-1 frames of u, oldest first.
-[[kernel]] void lfm3_ring_roll(const device float* u [[buffer(0)]], device bfloat* ring [[buffer(1)]],
-                               constant Lfm3ConvParams& p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+// The conv ring after a prefill chunk: the last K-1 frames of (old ring ++ u), oldest first. A chunk
+// shorter than K-1 frames takes its head from the ring it rolled in (the frames before its first row).
+[[kernel]] void lfm3_ring_roll(const device float* u [[buffer(0)]], const device bfloat* ring_in [[buffer(1)]],
+                               device bfloat* ring_out [[buffer(2)]], constant Lfm3ConvParams& p [[buffer(3)]],
+                               uint gid [[thread_position_in_grid]]) {
   const uint c = gid;
   if (c >= p.H) return;
-  for (uint j = 0; j + 1 < p.K; ++j)
-    ring[j * p.H + c] = bfloat(u[uint64_t(p.T - (p.K - 1) + j) * p.H + c]);
+  const uint prev = p.K - 1;
+  for (uint j = 0; j + 1 < p.K; ++j) {
+    // the concatenated sequence's frame (p.T + j), counting back from its end by (K - 1) - j... the new
+    // ring's frame j is the (p.T + j)th frame of (ring_in ++ u) overall
+    const uint idx = p.T + j;  // the frame's index in ring_in ++ u
+    const float x = idx < prev ? float(ring_in[idx * p.H + c]) : u[(idx - prev) * p.H + c];
+    ring_out[j * p.H + c] = bfloat(x);
+  }
 }
 
 // Plain decode attention at head dim 128, split over the positions: kernel 1 gives each (head, split) a

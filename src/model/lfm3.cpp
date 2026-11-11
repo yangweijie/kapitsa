@@ -544,12 +544,15 @@ void Lfm3::save(Encoder& e, const Seq& s, Checkpoint& c, int pos) {
   if (c.conv.size() != nc) c.conv.assign(nc, Buffer{});
   if (c.rec.size() != 2 * ns) c.rec.assign(2 * ns, Buffer{});
   size_t ic = 0, is = 0;
+  static const bool ck = getenv("LFM3_CKPT_DEBUG") && atoi(getenv("LFM3_CKPT_DEBUG"));
   for (int l = 0; l < cfg_.layers; ++l) {
     const char k = cfg_.kind[size_t(l)];
     if (k == 'C') {
       Buffer& dst = c.conv[ic++];
       if (!dst) dst = g.alloc(s.conv[size_t(conv_ordinal(l))].size, "lfm3_ring_ckpt");
       const uint32_t words = uint32_t(dst.size / 16);
+      if (ck) fprintf(stderr, "[ckpt save] conv l%d words %u src %zu dst %zu\n", l, words,
+                      s.conv[size_t(conv_ordinal(l))].size, dst.size);
       e.use(pipe("copy_u32"));
       e.buf(0, s.conv[size_t(conv_ordinal(l))]);
       e.buf(1, dst);
@@ -563,6 +566,7 @@ void Lfm3::save(Encoder& e, const Seq& s, Checkpoint& c, int pos) {
         if (!src) continue;
         if (!dst) dst = g.alloc(src.size, "lfm3_ring_ckpt");
         const uint32_t words = uint32_t(src.size / 16);
+        if (ck) fprintf(stderr, "[ckpt save] swa l%d kv%d words %u src %zu dst %zu\n", l, kv2, words, src.size, dst.size);
         e.use(pipe("copy_u32"));
         e.buf(0, src);
         e.buf(1, dst);
@@ -775,7 +779,8 @@ void Lfm3::encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingPar
       e.use(pipe("lfm3_ring_roll"));
       e.buf(0, pu_);
       e.buf(1, s.conv[size_t(conv_ordinal(l))]);
-      e.val(2, cp);
+      e.buf(2, s.conv[size_t(conv_ordinal(l))]);
+      e.val(3, cp);
       e.dispatch(H, 1, 1, 1);
       const Lfm3BcxParams bp2{uint32_t(T), H, 1};  // y = C ⊙ z, C from the row's middle plane
       e.use(pipe("lfm3_bcx"));

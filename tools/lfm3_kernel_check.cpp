@@ -254,16 +254,16 @@ int main(int argc, char** argv) {
     {
       const uint32_t N = 6144, K = 2048;
       std::vector<uint32_t> w(size_t(N) * (K / 8));
-      std::vector<uint16_t> sb(size_t(N) * (K / 64));
+      std::vector<uint16_t> sb(size_t(N) * (K / 64)), zbiases(size_t(N) * (K / 64), 0);
       for (auto& v : w) v = lcg(seed);
-      for (auto& v : sb) v = uint16_t(0x3f80);
+      for (auto& v : sb) v = uint16_t(0x3f80);  // scale 1, bias 0 (zbiases): value = code
       std::vector<float> yout(size_t(N), 0.f);
       ni::Buffer bw2 = gpu.alloc(w.size() * 4, "gw"), bs2 = gpu.alloc(sb.size() * 2, "gs"),
-                 bb2 = gpu.alloc(sb.size() * 2, "gb"), bx2 = gpu.alloc(xh2.size() * 2, "gx"),
+                 bb2 = gpu.alloc(zbiases.size() * 2, "gb"), bx2 = gpu.alloc(xh2.size() * 2, "gx"),
                  by2 = gpu.alloc(yout.size() * 4, "gy");
       memcpy(bw2.ptr(), w.data(), w.size() * 4);
       memcpy(bs2.ptr(), sb.data(), sb.size() * 2);
-      memcpy(bb2.ptr(), sb.data(), sb.size() * 2);
+      memcpy(bb2.ptr(), zbiases.data(), zbiases.size() * 2);
       memcpy(bx2.ptr(), xh2.data(), xh2.size() * 2);
       const ni::kp::Qmm p2{1, N, K, K, N, 0, 32, 0, 0};
       auto e3 = gpu.begin();
@@ -282,18 +282,18 @@ int main(int argc, char** argv) {
     {
       const uint32_t N = 6144, K = 2048;
       std::vector<uint32_t> w(size_t(N) * (K / 8));
-      std::vector<uint16_t> sb(size_t(N) * (K / 64));
+      std::vector<uint16_t> sb(size_t(N) * (K / 64)), zbiases(size_t(N) * (K / 64), 0);
       for (auto& v : w) v = lcg(seed);
-      for (auto& v : sb) v = uint16_t(0x3f80);
+      for (auto& v : sb) v = uint16_t(0x3f80);  // scale 1, bias 0 (zbiases): value = code
       std::vector<float> xf(size_t(H), 0.f), yout(size_t(N), 0.f), nw(size_t(H), 0.f);
       for (auto& v : xf) v = rnd(seed);
       for (auto& v : nw) v = rnd(seed);
       ni::Buffer bw3 = gpu.alloc(w.size() * 4, "tw"), bs3 = gpu.alloc(sb.size() * 2, "ts"),
-                 bb3 = gpu.alloc(sb.size() * 2, "tb"), bx3 = gpu.alloc(xf.size() * 4, "tx"),
+                 bb3 = gpu.alloc(zbiases.size() * 2, "tb"), bx3 = gpu.alloc(xf.size() * 4, "tx"),
                  by3 = gpu.alloc(yout.size() * 4, "ty"), bnw = gpu.alloc(nw.size() * 2, "tnw");
       memcpy(bw3.ptr(), w.data(), w.size() * 4);
       memcpy(bs3.ptr(), sb.data(), sb.size() * 2);
-      memcpy(bb3.ptr(), sb.data(), sb.size() * 2);
+      memcpy(bb3.ptr(), zbiases.data(), zbiases.size() * 2);
       memcpy(bx3.ptr(), xf.data(), xf.size() * 4);
       memcpy(bnw.ptr(), to_bf16_span(nw).data(), nw.size() * 2);
       // warm both
@@ -329,9 +329,9 @@ int main(int argc, char** argv) {
     // qmvf_b4g32_t1_r4_norm: the same matrix through the rowcache matvec, the norm folded — checked
     // against the CPU matvec (the codes' dequantized values times the normed x), then timed
     {
-      std::vector<float> yq(size_t(N), 0.f);
+      std::vector<float> yq(size_t(N), 0.f), ones(size_t(H), 1.0f);
       ni::Buffer by4 = gpu.alloc(yq.size() * 4, "ty4"), bnw = gpu.alloc(nw.size() * 2, "tnw");
-      memcpy(bnw.ptr(), to_bf16_span(nw).data(), nw.size() * 2);
+      memcpy(bnw.ptr(), to_bf16_span(ones).data(), ones.size() * 2);  // nw = 1: the norm factor is visible
       auto run = [&] {
         ni::kp::Qmvf pm{};
         pm.K = K;
@@ -359,42 +359,25 @@ int main(int argc, char** argv) {
         e5->commit_and_wait();
       };
       run();
-      // the CPU expectation: sum_k float(w bit k) * s * (x[k] normed) + b — from the same words/scales
+      // the CPU expectation with the norm folded and nw = 1: y[row] = sum_k code_k * x_k * inv,
+      // the codes read low nibble first (the engine's packing), scale 1 / bias 0 making the value
+      // convention unambiguous
+      run();
+      memcpy(yq.data(), by4.as<float>(), yq.size() * 4);
+      double ss = 0;
+      for (uint32_t k = 0; k < K; ++k) ss += double(xf[k]) * xf[k];
+      const double inv = 1.0 / std::sqrt(ss / K + 1e-5);
       bool good = true;
-      {
-        // dequantize the first row's codes the way qmvf reads them (4-bit, group 32, scale+bias per group)
-        std::vector<double> acc(size_t(N), 0.0);
-        const uint16_t* sw = static_cast<const uint16_t*>((const void*)sb.data());
-        (void)sw;
-        for (uint32_t row = 0; row < N && good; ++row) {
-          double dot = 0;
-          for (uint32_t k = 0; k < K; ++k) {
-            const uint32_t word = w[size_t(row) * (K / 8) + k / 8];
-            const uint32_t code = (word >> (4 * (k % 8))) & 0xF;
-            const uint32_t grp = k / 32;
-            // the scale/bias from the bf16 words (1.0 here), the code's value scale * code + bias
-            const float sc = 1.0f, bi = 0.0f;
-            dot += double(sc * float(code) + bi) * double(xf[k]);
-          }
-          acc[row] = dot;
+      for (uint32_t row = 0; row < 8 && good; ++row) {
+        double dot = 0;
+        for (uint32_t k = 0; k < K; ++k) {
+          const uint32_t word = w[size_t(row) * (K / 8) + k / 8];
+          const uint32_t code = (word >> (4 * (k % 8))) & 0xF;
+          dot += double(float(code)) * double(xf[k]) * inv;
         }
-        run();
-        memcpy(yq.data(), by4.as<float>(), yq.size() * 4);
-        // the kernel folds the RMS norm of x with eps: y = W . (x * inv * 1) — compare against the same
-        double ss = 0;
-        for (uint32_t k = 0; k < K; ++k) ss += double(xf[k]) * xf[k];
-        const double inv = 1.0 / std::sqrt(ss / K + 1e-5);
-        for (uint32_t row = 0; row < 8 && good; ++row) {
-          double dot = 0;
-          for (uint32_t k = 0; k < K; ++k) {
-            const uint32_t word = w[size_t(row) * (K / 8) + k / 8];
-            const uint32_t code = (word >> (4 * (k % 8))) & 0xF;
-            dot += double(float(code)) * double(xf[k]) * inv;
-          }
-          if (fabsf(yq[row] - float(dot)) > 1e-2f * (1.f + fabsf(float(dot)))) {
-            fprintf(stderr, "  qmvf diff row %u: %g vs %g\n", row, yq[row], float(dot));
-            good = false;
-          }
+        if (fabsf(yq[row] - float(dot)) > 1e-2f * (1.f + fabsf(float(dot)))) {
+          fprintf(stderr, "  qmvf diff row %u: %g vs %g\n", row, yq[row], float(dot));
+          good = false;
         }
       }
       ok("qmvf_b4g32: the rowcache matvec with the folded norm", good);
@@ -965,27 +948,52 @@ int main(int argc, char** argv) {
       }
     }
     {
-      // the ring roll: the last K-1 frames of u, oldest first, as bf16
+      // the ring roll: the last K-1 frames of (old ring ++ u) — for a chunk shorter than K-1 the new
+      // ring keeps its head from the ring the chunk rolled in
       std::vector<float> u(size_t(T * H));
       for (auto& v : u) v = rnd(seed);
       std::vector<uint16_t> ring(size_t((K - 1) * H), 0);
-      ni::Buffer bu = gpu.alloc(u.size() * 4, "ru"), brg = gpu.alloc(ring.size() * 2, "rrg");
+      std::vector<float> rinf(size_t((K - 1) * H));
+      for (auto& v : rinf) v = rnd(seed);
+      for (size_t i = 0; i < ring.size(); ++i) ring[i] = to_bf16(rinf[i]);
+      ni::Buffer bu = gpu.alloc(u.size() * 4, "ru"), brg = gpu.alloc(ring.size() * 2, "rrg"),
+                 bri = gpu.alloc(ring.size() * 2, "rri");
       memcpy(bu.ptr(), u.data(), u.size() * 4);
+      memcpy(bri.ptr(), ring.data(), ring.size() * 2);
       Lfm3ConvParams cp{T, H, K};
-      auto e5 = gpu.begin();
-      e5->use(gpu.pipeline("lfm3_ring_roll"));
-      e5->buf(0, bu);
-      e5->buf(1, brg);
-      e5->val(2, cp);
-      e5->dispatch(H, 1, 1, 1);
-      e5->commit_and_wait();
-      bool good = true;
-      for (uint32_t j = 0; j < K - 1; ++j)
-        for (uint32_t i = 0; i < H; ++i) {
-          const float want = u[size_t(T - (K - 1) + j) * H + i];
-          good = good && fabsf(from_bf16(brg.as<uint16_t>()[size_t(j) * H + i]) - want) <= 2e-2f * (1.f + fabsf(want));
-        }
-      ok("ring roll: the chunk's last K-1 frames", good);
+      auto roll = [&](uint32_t T3) {
+        Lfm3ConvParams c3{T3, H, K};
+        auto e5 = gpu.begin();
+        e5->use(gpu.pipeline("lfm3_ring_roll"));
+        e5->buf(0, bu);
+        e5->buf(1, bri);
+        e5->buf(2, brg);
+        e5->val(3, c3);
+        e5->dispatch(H, 1, 1, 1);
+        e5->commit_and_wait();
+      };
+      auto check = [&](uint32_t T3, const std::vector<float>& uf, const char* name) {
+        roll(T3);
+        bool good = true;
+        for (uint32_t j = 0; j < K - 1 && good; ++j)
+          for (uint32_t i = 0; i < H && good; ++i) {
+            // the new ring's frame j = the (T3 + j)th frame of (ring_in ++ u)
+            const float want = T3 + j < K - 1 ? rinf[size_t(T3 + j) * H + i] : uf[size_t(T3 + j - (K - 1)) * H + i];
+            const float got = from_bf16(brg.as<uint16_t>()[size_t(j) * H + i]);
+            if (got != want) fprintf(stderr, "  roll j%u c%u: got %.4f want %.4f\n", j, i, got, want);
+            good = good && fabsf(got - want) <= 2e-2f * (1.f + fabsf(want));
+          }
+        if (!good) fprintf(stderr, "  [%s failed]\n", name);
+        ok(name, good);
+      };
+      check(T, u, "ring roll: the chunk's last K-1 frames");
+      {
+        // a chunk shorter than K-1: the head comes from the ring the chunk rolled in
+        std::vector<float> u3(size_t(3 * H));
+        for (auto& v : u3) v = rnd(seed);
+        memcpy(bu.ptr(), u3.data(), u3.size() * 4);
+        check(3, u3, "ring roll: a chunk shorter than K-1 keeps the old ring's head");
+      }
     }
   }
 
@@ -1055,16 +1063,19 @@ int main(int argc, char** argv) {
     {
       const uint32_t H2 = 128, K2 = 7, T2 = 20;
       std::vector<float> u(size_t(T2 * H2));
-      std::vector<uint16_t> ring(size_t((K2 - 1) * H2), 0);
+      std::vector<uint16_t> ring_in(size_t((K2 - 1) * H2), 0), ring_out(size_t((K2 - 1) * H2), 0);
       for (auto& v : u) v = rnd(seed);
-      ni::Buffer bu = gpu.alloc(u.size() * 4, "fpu"), brg = gpu.alloc(ring.size() * 2, "fpg");
+      ni::Buffer bu = gpu.alloc(u.size() * 4, "fpu"), bri = gpu.alloc(ring_in.size() * 2, "fpi"),
+                 brg = gpu.alloc(ring_out.size() * 2, "fpo");
       memcpy(bu.ptr(), u.data(), u.size() * 4);
+      memcpy(bri.ptr(), ring_in.data(), ring_in.size() * 2);
       const Lfm3ConvParams cp{T2, H2, K2};
       auto e2 = gpu.begin();
       e2->use(gpu.pipeline("lfm3_ring_roll"));
       e2->buf(0, bu);
-      e2->buf(1, brg);
-      e2->val(2, cp);
+      e2->buf(1, bri);
+      e2->buf(2, brg);
+      e2->val(3, cp);
       e2->dispatch(H2, 1, 1, 1);
       e2->commit_and_wait();
       bool good2 = true;
