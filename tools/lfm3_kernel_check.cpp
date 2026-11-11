@@ -351,6 +351,14 @@ int main(int argc, char** argv) {
         e5->buf(1, bs3);
         e5->buf(2, bb3);
         e5->buf(3, by4);
+        // the kernel declares all four segments' slots whatever nseg says, and Metal validates every
+        // declared binding — segments 1-3 repeat segment 0's buffers (the engine's enc_mv1 pattern)
+        for (int seg = 1; seg < 4; ++seg) {
+          e5->buf(4 * seg + 0, bw3);
+          e5->buf(4 * seg + 1, bs3);
+          e5->buf(4 * seg + 2, bb3);
+          e5->buf(4 * seg + 3, by4);
+        }
         e5->buf(16, bx3);
         e5->val(17, pm);
         e5->buf(18, bnw);
