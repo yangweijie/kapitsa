@@ -302,6 +302,74 @@ struct Lfm3GateParams {
   uint D;  // head dim
 };
 
+// The prefill attention's split form (the decode attention's split pattern): each (row, head)'s window
+// is cut into `splits` chunks; one thread per (head x split, row) scores its chunk twice (the max, then
+// the partial output and denominator) and one thread per (head x dim, row) merges the partials with the
+// online-softmax weights and applies the per-head sigmoid gate. An empty chunk's partial is -1e30 / 0,
+// which the merge's exp weights away. The serial lfm3_attn_p stays as the reference.
+struct Lfm3AttnPSplitParams {
+  uint T;
+  uint Hq;
+  uint Hkv;
+  uint D;
+  uint cap;
+  uint pos0;
+  uint window;
+  uint splits;
+  float scale;
+};
+[[kernel]] void lfm3_attn_p_split(const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]],
+                                  const device half* vc [[buffer(2)]], device float* part_o [[buffer(3)]],
+                                  device float* part_m [[buffer(4)]], device float* part_s [[buffer(5)]],
+                                  constant Lfm3AttnPSplitParams& p [[buffer(6)]], uint2 gid [[thread_position_in_grid]]) {
+  const uint hs = gid.x, t = gid.y;
+  const uint h = hs / p.splits, sp = hs % p.splits;
+  if (h >= p.Hq || t >= p.T || sp >= p.splits) return;
+  const uint pos = p.pos0 + t;
+  const device half* kkh = kc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
+  const device half* vvh = vc + uint64_t(h / (p.Hq / p.Hkv)) * p.cap * p.D;
+  const uint beg = p.window && pos >= p.window ? pos + 1 - p.window : 0;
+  const uint len = pos - beg + 1, chunk = (len + p.splits - 1) / p.splits;
+  const uint lo = beg + sp * chunk;
+  const uint hi = metal::min(lo + chunk, pos + 1);
+  const device float* qh = q + (uint64_t(t) * p.Hq + h) * p.D;
+  float m = -1e30f;
+  for (uint s = lo; s < hi; ++s) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s % p.cap) * p.D + d]);
+    m = max(m, score * p.scale);
+  }
+  device float* oh = part_o + ((uint64_t(t) * p.Hq + h) * p.splits + sp) * p.D;
+  for (uint d = 0; d < p.D; ++d) oh[d] = 0;
+  float denom = 0;
+  for (uint s = lo; s < hi; ++s) {
+    float score = 0;
+    for (uint d = 0; d < p.D; ++d) score += qh[d] * float(kkh[uint64_t(s % p.cap) * p.D + d]);
+    const float wgt = metal::precise::exp(score * p.scale - m);
+    denom += wgt;
+    for (uint d = 0; d < p.D; ++d) oh[d] += wgt * float(vvh[uint64_t(s % p.cap) * p.D + d]);
+  }
+  part_m[(uint64_t(t) * p.Hq + h) * p.splits + sp] = hi > lo ? m : -1e30f;
+  part_s[(uint64_t(t) * p.Hq + h) * p.splits + sp] = hi > lo ? denom : 0.f;
+}
+[[kernel]] void lfm3_attn_p_merge(const device float* part_o [[buffer(0)]], const device float* part_m [[buffer(1)]],
+                                  const device float* part_s [[buffer(2)]], const device float* gate [[buffer(3)]],
+                                  device float* out [[buffer(4)]], constant Lfm3AttnPSplitParams& p [[buffer(5)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+  const uint hd = gid.x, t = gid.y;
+  const uint h = hd / p.D, d = hd % p.D;
+  if (h >= p.Hq || t >= p.T || d >= p.D) return;
+  float M = -1e30f;
+  for (uint sp = 0; sp < p.splits; ++sp) M = max(M, part_m[(uint64_t(t) * p.Hq + h) * p.splits + sp]);
+  float num = 0, den = 0;
+  for (uint sp = 0; sp < p.splits; ++sp) {
+    const float wgt = metal::precise::exp(part_m[(uint64_t(t) * p.Hq + h) * p.splits + sp] - M);
+    num += wgt * part_o[((uint64_t(t) * p.Hq + h) * p.splits + sp) * p.D + d];
+    den += wgt * part_s[(uint64_t(t) * p.Hq + h) * p.splits + sp];
+  }
+  out[(uint64_t(t) * p.Hq + h) * p.D + d] = num / den * sigmoid(gate[uint64_t(t) * p.Hq + h]);
+}
+
 // The attention's per-head sigmoid gate packed beside the query, the layout attn.metal's kernels read
 // (qg[t, h] = [query (D) | gate (D), the per-head scalar broadcast]). One thread per (token, head).
 [[kernel]] void lfm3_gate_pack(const device float* q [[buffer(0)]], const device float* gate [[buffer(1)]],
