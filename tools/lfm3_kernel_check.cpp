@@ -44,7 +44,7 @@ struct Lfm3AttnSplitParams {
   float scale;
 };
 struct Lfm3QkParams {
-  uint32_t T, Hq, Hkv, D, cap, pos0;
+  uint32_t T, Hq, Hkv, D, cap, pos0, end;
 };
 struct Lfm3NormParams {
   uint32_t D;
@@ -236,7 +236,7 @@ int main(int argc, char** argv) {
     memcpy(bkw.ptr(), kw.data(), kw.size() * 2);
     memcpy(bf.ptr(), freqs.data(), 256);
     memcpy(bg.ptr(), gate.data(), gate.size() * 4);
-    const Lfm3QkParams qp{1, Hq, Hkv, D, cap, pos};
+    const Lfm3QkParams qp{1, Hq, Hkv, D, cap, pos, pos + 1};
     auto e = gpu.begin();
     e->use(gpu.pipeline("lfm3_qk_prep"));
     e->buf(0, bqkv);
@@ -822,7 +822,7 @@ int main(int argc, char** argv) {
       memcpy(bkw.ptr(), to_bf16_span(kw).data(), D * 2);
       memcpy(bf.ptr(), freqs.data(), 256);
       const uint32_t pos0 = 5;
-      Lfm3QkParams qp{T, Hq, Hkv, D, cap, pos0};
+      Lfm3QkParams qp{T, Hq, Hkv, D, cap, pos0, pos0 + T};
       auto e3 = gpu.begin();
       e3->use(gpu.pipeline("lfm3_qk_prep"));
       e3->buf(0, bqkv);

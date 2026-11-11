@@ -115,6 +115,7 @@ class Lfm3 : public Model {
   const Lfm3Config& config() const { return cfg_; }
   const float* logits_for_debug() const { return logits_.as<float>(); }
   std::string formats_summary() const;
+  void xprobe_dump() const;  // LFM3_X_PROBE: the per-layer residual rows of the last encode_prefill
 
  private:
   void load();
