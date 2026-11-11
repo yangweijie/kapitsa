@@ -101,6 +101,9 @@ struct Lfm3QkParams {
   uint D;      // head dim (128)
   uint cap;    // the caches' row stride
   uint pos0;   // the first row's position
+  uint end;    // pos0 + T: a sliding cache's slot is written by the chunk's newest position only -
+               // two threads mapping to one slot (pos and pos + cap) would race, and the ring would
+               // hold whichever lost; the newest writer leaves the last min(T, cap) positions correct
 };
 
 // QK-RMSNorm, the zero-tail RoPE (lfm3_rope_ref's semantics: pair (i, i + D/2) rotates by pos * freqs[i],
@@ -135,6 +138,7 @@ struct Lfm3QkParams {
     const float inv = metal::precise::rsqrt(ss / float(p.D) + 1e-5f);
     float n[128];
     for (uint d = 0; d < p.D && d < 128; ++d) n[d] = x[d] * inv * float(kw[d]);
+    if (pos + p.cap < p.end) return;  // a later row in this chunk overwrites this slot: let it
     device half* kh = kc + (uint64_t(h) * p.cap + pos % p.cap) * p.D;
     for (uint i = 0; i < p.D / 2; ++i) {
       const float ang = float(pos) * freqs[i], c = metal::precise::cos(ang), s = metal::precise::sin(ang);
@@ -143,6 +147,7 @@ struct Lfm3QkParams {
     }
   } else if (hraw < p.Hq + 2 * p.Hkv) {  // a v head: into the cache raw
     const uint h = hraw - p.Hq - p.Hkv;
+    if (pos + p.cap < p.end) return;  // the newest writer only, as the k head above
     const device float* x = qkv + row + QD + KD + uint64_t(h) * p.D;
     device half* vh = vc + (uint64_t(h) * p.cap + pos % p.cap) * p.D;
     for (uint d = 0; d < p.D; ++d) vh[d] = half(x[d]);

@@ -189,6 +189,23 @@ struct Lfm3AttnSplitParams {
   float scale;
 };
 static constexpr uint32_t kAttnSplits = 32;
+// LFM3_X_PROBE's per-layer residual rows (the layerwise bisect for the run-to-run wobble)
+static std::vector<Buffer>& xprobe_state() {
+  static std::vector<Buffer> v;
+  return v;
+}
+void Lfm3::xprobe_dump() const {
+  static const bool on = getenv("LFM3_X_PROBE") && atoi(getenv("LFM3_X_PROBE"));
+  if (!on) return;
+  const auto& xp = xprobe_state();
+  const uint32_t H = uint32_t(cfg_.hidden);
+  for (size_t i = 0; i < xp.size(); ++i) {
+    fprintf(stderr, "[xprobe] slot %zu%s:", i, i == 0 ? " (embed)" : "");
+    const float* r = xp[i].as<float>();
+    for (uint32_t j = 0; j < H; ++j) fprintf(stderr, " %.9g", r[j]);
+    fprintf(stderr, "\n");
+  }
+}
 struct Lfm3ConvParams {
   uint32_t T, H, K;
 };
@@ -196,7 +213,7 @@ struct Lfm3BcxParams {
   uint32_t T, H, which;  // which 0: u = B ⊙ x, 1: y = C ⊙ z (lfm3.metal)
 };
 struct Lfm3QkParams {
-  uint32_t T, Hq, Hkv, D, cap, pos0;
+  uint32_t T, Hq, Hkv, D, cap, pos0, end;
 };
 struct Lfm3AttnParams {
   uint32_t Hq, Hkv, D, cap, pos, window;
@@ -545,18 +562,23 @@ void Lfm3::reset(Seq& s) {
 void Lfm3::save(Encoder& e, const Seq& s, Checkpoint& c, int pos) {
   Gpu& g = Gpu::get();
   const size_t nc = size_t(n_conv_), ns = size_t(std::count(cfg_.kind.begin(), cfg_.kind.end(), 'S'));
+  static const bool ck = getenv("LFM3_CKPT_DEBUG") && atoi(getenv("LFM3_CKPT_DEBUG"));
   if (c.conv.size() != nc) c.conv.assign(nc, Buffer{});
   if (c.rec.size() != 2 * ns) c.rec.assign(2 * ns, Buffer{});
+  if (ck) {
+    fprintf(stderr, "[ckpt save] entry this=%p conv=%zu rec=%zu slots:", (void*)&c, c.conv.size(), c.rec.size());
+    for (auto& b : c.rec) fprintf(stderr, " %p/%zu", b.mtl, b.size);
+    fprintf(stderr, "\n");
+  }
   size_t ic = 0, is = 0;
-  static const bool ck = getenv("LFM3_CKPT_DEBUG") && atoi(getenv("LFM3_CKPT_DEBUG"));
   for (int l = 0; l < cfg_.layers; ++l) {
     const char k = cfg_.kind[size_t(l)];
     if (k == 'C') {
       Buffer& dst = c.conv[ic++];
       if (!dst) dst = g.alloc(s.conv[size_t(conv_ordinal(l))].size, "lfm3_ring_ckpt");
       const uint32_t words = uint32_t(dst.size / 16);
-      if (ck) fprintf(stderr, "[ckpt save] conv l%d words %u src %zu dst %zu\n", l, words,
-                      s.conv[size_t(conv_ordinal(l))].size, dst.size);
+      if (ck) fprintf(stderr, "[ckpt save] conv l%d words %u src %zu@%p dst %zu@%p\n", l, words,
+                      s.conv[size_t(conv_ordinal(l))].size, s.conv[size_t(conv_ordinal(l))].mtl, dst.size, dst.mtl);
       e.use(pipe("copy_u32"));
       e.buf(0, s.conv[size_t(conv_ordinal(l))]);
       e.buf(1, dst);
@@ -566,17 +588,21 @@ void Lfm3::save(Encoder& e, const Seq& s, Checkpoint& c, int pos) {
       for (int kv2 = 0; kv2 < 2; ++kv2) {
         const Buffer& src = kv2 ? s.vc[size_t(l)] : s.kc[size_t(l)];
         Buffer& dst = c.rec[2 * size_t(is) + size_t(kv2)];
-        ++is;
         if (!src) continue;
-        if (!dst) dst = g.alloc(src.size, "lfm3_ring_ckpt");
+        // the size check re-allocs on a stale view; the index must be the layer's own pair (is counts
+        // layers: 2*is+kv2 walks 0,1,2,3,... — an is that counted kv2 iterations walked 0,2,4,... and
+        // read/wrote past the vector, the heap corruption behind the intermittent save crash)
+        if (!dst || dst.size != src.size) dst = g.alloc(src.size, "lfm3_ring_ckpt");
         const uint32_t words = uint32_t(src.size / 16);
-        if (ck) fprintf(stderr, "[ckpt save] swa l%d kv%d words %u src %zu dst %zu\n", l, kv2, words, src.size, dst.size);
+        if (ck) fprintf(stderr, "[ckpt save] swa l%d kv%d slot@%p words %u src %zu@%p dst %zu@%p\n", l, kv2,
+                        (void*)&dst, words, src.size, src.mtl, dst.size, dst.mtl);
         e.use(pipe("copy_u32"));
         e.buf(0, src);
         e.buf(1, dst);
         e.val(2, words);
         e.dispatch((words + 255) / 256, 1, 1, 256);
       }
+      ++is;
     }
   }
   c.pos = pos;
@@ -599,7 +625,6 @@ void Lfm3::restore(Encoder& e, Seq& s, const Checkpoint& c) {
     } else if (k == 'S') {
       for (int kv2 = 0; kv2 < 2; ++kv2) {
         const Buffer& src = c.rec[2 * size_t(is) + size_t(kv2)];
-        ++is;
         Buffer& dst = kv2 ? s.vc[size_t(l)] : s.kc[size_t(l)];
         if (!src || !dst) continue;
         const uint32_t words = uint32_t(std::min(src.size, dst.size) / 16);
@@ -609,6 +634,7 @@ void Lfm3::restore(Encoder& e, Seq& s, const Checkpoint& c) {
         e.val(2, words);
         e.dispatch((words + 255) / 256, 1, 1, 256);
       }
+      ++is;
     }
   }
 }
@@ -689,7 +715,7 @@ void Lfm3::encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, ui
       mv(L.gate, x_, L.in_norm, gate_, 0);
       const uint32_t cache_cap = L.kind == 'S' ? uint32_t(cfg_.window + 8 + 7) / 8 * 8 : uint32_t(s.cap);
       const Lfm3QkParams qp{1, uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.hd), cache_cap,
-                            uint32_t(pos)};
+                            uint32_t(pos), uint32_t(pos + 1)};
       e.use(pipe("lfm3_qk_prep"));
       e.buf(0, qkv_);
       e.buf(1, L.qn->buf);
@@ -760,6 +786,23 @@ void Lfm3::encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingPar
   const uint32_t QD = uint32_t(cfg_.hq) * uint32_t(cfg_.hd), KD = uint32_t(cfg_.hkv) * uint32_t(cfg_.hd);
   if (pos0 + T > s.cap && !reserve(s, pos0 + T)) fatal("context full (%d)", s.cap);
   embed(e, s.tok, pos0, T, px_);
+  // LFM3_X_PROBE: a per-layer copy of the residual stream's last row, read back after the commit
+  // (xprobe_dump); the layerwise bisect for the run-to-run logit wobble
+  static const bool xprobe = getenv("LFM3_X_PROBE") && atoi(getenv("LFM3_X_PROBE"));
+  static std::vector<Buffer>& xp = xprobe_state();
+  if (xprobe && xp.empty()) {
+    Gpu& gg = Gpu::get();
+    xp.assign(size_t(cfg_.layers) + 1, Buffer{});
+    for (auto& b : xp) b = gg.alloc(size_t(H) * 4, "lfm3_xprobe");
+  }
+  const auto xcopy = [&](int slot) {
+    e.use(pipe("copy_u32"));
+    e.buf(0, px_.view(size_t(T - 1) * H * 4, size_t(H) * 4));
+    e.buf(1, xp[size_t(slot)]);
+    e.val(2, uint32_t(H) / 4);
+    e.dispatch((H / 4 + 255) / 256, 1, 1, 256);
+  };
+  if (xprobe) xcopy(0);
   for (int l = 0; l < cfg_.layers; ++l) {
     const Lfm3Layer& L = layers_[size_t(l)];
     to_half(e, px_, L.in_norm, pxh_, T);
@@ -805,7 +848,7 @@ void Lfm3::encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingPar
       lin(e, L.gate, pxh_, pgate_, T, false, 0);
       const uint32_t cache_cap = L.kind == 'S' ? uint32_t(cfg_.window + 8 + 7) / 8 * 8 : uint32_t(s.cap);
       const Lfm3QkParams qp{uint32_t(T), uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.hd), cache_cap,
-                            uint32_t(pos0)};
+                            uint32_t(pos0), uint32_t(pos0 + T)};
       e.use(pipe("lfm3_qk_prep"));
       e.buf(0, pqkv_);
       e.buf(1, L.qn->buf);
@@ -845,6 +888,7 @@ void Lfm3::encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingPar
     to_half(e, ph_, nullptr, phh_, T, I);
     lin(e, L.w2, phh_, pmix_, T, false, 0);
     res_norm(e, pmix_, L.post_ffn_norm, px_, px_, T);
+    if (xprobe) xcopy(l + 1);
   }
   if (sample) {
     // the chunk's last row through the final norm and the tied head

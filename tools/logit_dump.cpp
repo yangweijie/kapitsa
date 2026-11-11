@@ -477,6 +477,8 @@ int main(int argc, char** argv) {
       }
       t_prefill += now_ms() - t0;
       prefilled += w.L0;
+      if (getenv("LFM3_X_PROBE"))
+        if (auto* l3 = dynamic_cast<ni::Lfm3*>(&m)) l3->xprobe_dump();
       put_row(outs[0], pre_rec[size_t(grp[j] - wins.data())], logits(), w.toks[size_t(w.L0)]);  // the sampled row
       auto e = g.begin();
       m.save(*e, s, cks[j], w.L0);
