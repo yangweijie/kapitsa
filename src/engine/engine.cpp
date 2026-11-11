@@ -5,6 +5,7 @@
 #include "engine/stop_filter.h"
 #include "engine/reasoning_memory.h"
 #include "engine/tool_args.h"
+#include "model/lfm3_config.h"
 #include "model/qwen4_config.h"
 #include "splash/runtime.h"
 #include "util/json_file.h"
@@ -773,6 +774,13 @@ std::string unsupported_model(const std::string& model_dir) {
   if (!j.is_object()) return model_dir + ": its config.json is not valid JSON.";
   // Qwen 4 (qwen4*): what the Qwen3.8-Flash-Next path does not run, or "" (model/qwen4_config.h)
   if (qwen4_family(j)) return qwen4_refusal(j, model_dir);
+  // LFM3 (lfm3*): what the LFM3 path does not run, precisely (model/lfm3_config.h); a runnable one waits for
+  // the backend
+  if (lfm3_family(j)) {
+    if (const std::string why = lfm3_refusal(j, model_dir); !why.empty()) return why;
+    return model_dir + " is a lfm3 model, and Kapitsa's LFM3 path does not load models in this build yet: its "
+           "GGUF imports (`kapitsa import`), and the backend that runs the folder is the next change.";
+  }
   if (Qwen4Exp::is_model(model_dir) || Dory::is_model(model_dir) || NemotronH::is_model(model_dir) ||
       Flint::is_model(model_dir) || Clover::is_model(model_dir))
     return "";

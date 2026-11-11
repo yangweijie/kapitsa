@@ -311,6 +311,7 @@ std::string OllamaGenerateStream::end(const ChatResult& res) {
 // Family from name (the catalog has no architecture field).
 static std::string model_family(const std::string& name) {
   if (name.find("nemotron") != std::string::npos || name.find("dory") != std::string::npos) return "mamba2";
+  if (name.find("lfm3") != std::string::npos) return "lfm";
   if (name.find("flint") != std::string::npos) return "qwen3_moe";
   if (name.find("clover") != std::string::npos) return "qwen3_moe";
   if (name.find("qwen") != std::string::npos) return "qwen3";
@@ -332,15 +333,17 @@ static ojson model_details(const std::string& name, const std::string& quant) {
 static ojson model_capabilities(const std::string& name) {
   ojson caps = ojson::array({"completion"});
   if (name.find("qwen") != std::string::npos || name.find("flint") != std::string::npos ||
-      name.find("clover") != std::string::npos || name.find("nemotron") != std::string::npos)
+      name.find("clover") != std::string::npos || name.find("nemotron") != std::string::npos ||
+      name.find("lfm3") != std::string::npos)
     caps.push_back("tools");
   if (name.find("qwen") != std::string::npos || name.find("flint") != std::string::npos ||
-      name.find("clover") != std::string::npos)
+      name.find("clover") != std::string::npos || name.find("lfm3") != std::string::npos)
     caps.push_back("thinking");
   // Vision: every catalog model reads images except these text-only ones
   bool text_only = name.find("lightning") != std::string::npos || name.find("dory") != std::string::npos ||
                    name.find("nano-4b") != std::string::npos || name.find("nano-9b") != std::string::npos ||
-                   name.find("flint") != std::string::npos || name.find("clover") != std::string::npos;
+                   name.find("flint") != std::string::npos || name.find("clover") != std::string::npos ||
+                   name.find("lfm3") != std::string::npos;
   if (!text_only) caps.push_back("vision");
   return caps;
 }

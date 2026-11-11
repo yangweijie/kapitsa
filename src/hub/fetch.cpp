@@ -12,6 +12,7 @@
 #include "gguf/import.h"
 #include "hub/hub.h"
 #include "hub/http.h"
+#include "model/lfm3_config.h"
 #include "model/qwen4_config.h"
 #include "util/term.h"
 
@@ -1118,6 +1119,13 @@ void check_supported(HttpClient& c, const Listing& L) {
   // a Qwen 4 model the Qwen3.8-Flash-Next path does not run is refused here, before its weights (model/qwen4_config.h)
   if (qwen4_family(j))
     if (const std::string why = qwen4_refusal(j, L.repo); !why.empty()) throw Error(why);
+  // an LFM3 repo: what the LFM3 path does not run, precisely; a runnable one waits for the backend, which the
+  // GGUF import's folders also wait for (model/lfm3_config.h)
+  if (lfm3_family(j)) {
+    if (const std::string why = lfm3_refusal(j, L.repo); !why.empty()) throw Error(why);
+    throw Error(L.repo + " is an lfm3 model, and Kapitsa's LFM3 path does not load models in this build yet. Its "
+                "GGUF imports with `kapitsa import`.");
+  }
   if (j.value("model_type", std::string()) == "flint") {
     const json q = j.value("quantization", json::object());
     if (!q.is_object() || (q.value("bits", 0) != 4 && q.value("bits", 0) != 8) || q.value("group_size", 0) != 64)
