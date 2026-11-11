@@ -6,7 +6,7 @@
 
 **KQuant.** The Qwen3.5 [4B](https://huggingface.co/nace-ai/Qwen3.5-4B-MLX-4bit-KQuant) and [9B](https://huggingface.co/nace-ai/Qwen3.5-9B-MLX-4bit-KQuant) and the Qwen3.6 [35B-A3B](https://huggingface.co/nace-ai/Qwen3.6-35B-A3B-MLX-4bit-KQuant) downloads are closer to the original model at the same size, and write faster on an M5 Pro ([numbers](#kquant)).
 
-Kapitsa is an inference engine for Apple silicon that runs Qwen, Nemotron and Recursive's Flint models locally, built for coding agents. It starts opencode, Claude Code, Codex, Pi, Hermes, aider or Goose on a local model, and serves OpenAI and Anthropic APIs.
+Kapitsa is an inference engine for Apple silicon that runs Qwen, Nemotron and Recursive's Flint models locally, built for coding agents. Liquid's LFM3 GGUFs convert with `kapitsa import`. It starts opencode, Claude Code, Codex, Pi, Hermes, aider or Goose on a local model, and serves OpenAI and Anthropic APIs.
 
 [Quickstart](#quickstart) · [What's new](#-whats-new) · [Features](#features) · [Benchmarks](#benchmarks) · [CLI](#cli) · [Models](#models) · [How KFlash works](docs/kflash.md) · [Docs](docs/usage.md) · [Xcode 26 guide](docs/xcode-guide.md) · [日本語](README.ja.md)
 

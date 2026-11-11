@@ -499,6 +499,28 @@ const std::vector<CatalogModel>& catalog() {
             .companions = {},
             .download_gb = 11.86},
        }},
+      // Liquid AI's tri-hybrid (src/model/lfm3.h): gated short convolutions, full and sliding attention. The
+      // GGUF imports with the file's own codes (4-bit group 32; the import's lfm3 builder), the 6 Q6_K tensors
+      // (the embedding among them) in 8-bit group 64.
+      {.name = "lfm3-1.7b",
+       .aliases = {"lfm3", "liquid-lfm3"},
+       .title = "Liquid LFM3-1.7B",
+       .about = "Liquid AI's 1.7B tri-hybrid for local agents: gated short convolutions and sliding attention",
+       .brief = "Liquid tri-hybrid, 1.7B",
+       .default_variant = "4bit",
+       .fallbacks = {},
+       .variants = {
+           {.name = "4bit",
+            .quant = "GGUF Q4_1 (codes as stored, 4-bit group 32), 8-bit group 64 embedding",
+            .label = "4-bit (bartowski Q4_1 GGUF)",
+            .repo = "bartowski/LFM3-1.7B-GGUF",
+            .revision = "9693095706f068e826377eaf576263ebeda926df",
+            .gguf = {.path = "LFM3-1.7B-Q4_1.gguf",
+                     .sha256 = "17c54a087eef97c77d217d4b474e27855df23f833dd0499009d15aa5fb6bb794",
+                     .size = 1145353792},
+            .companions = {},
+            .download_gb = 1.15},
+       }},
       // DiffuSpace's block-diffusion MoE tuned from Qwen3.6-35B-A3B (src/model/clover.h), last in by_preference's
       // order: picked by --model
       {.name = "clover-35b-a3b",

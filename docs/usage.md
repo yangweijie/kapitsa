@@ -249,8 +249,9 @@ checkpoints in the Hugging Face layout, and weights larger than this Mac's memor
 `kapitsa import FILE.gguf` converts a GGUF file once into a model folder in the store and prints its name for
 `kapitsa serve --model`; `kapitsa serve --model FILE.gguf` and the coding-agent commands convert on first use and reuse
 the conversion after that. It reads the GGUF architectures `qwen35` and `qwen35moe` (Qwen3.5, 3.6 and 3.8) as LM Studio,
-Ollama (its blob files) and Hugging Face GGUF repos ship them, and `flint` (Recursive's Flint, where its routed experts
-are IQ blocks: below); a split file is named by any of its parts.
+Ollama (its blob files) and Hugging Face GGUF repos ship them, `flint` (Recursive's Flint, where its routed experts
+are IQ blocks: below), and `lfm3` (Liquid's LFM3: every linear keeps its own format, a Q4_1 file's codes as stored;
+its folder loads once the LFM3 backend lands); a split file is named by any of its parts.
 
 The MTP head comes from the file, an `mtp-*.gguf` beside it, an Ollama model's draft layer, or `--mtp FILE`. Options:
 `--name NAME` (the folder; default: from the file name), `--threads N` (default: the performance cores, at most 8),
