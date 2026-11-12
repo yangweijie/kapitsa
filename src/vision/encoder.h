@@ -42,6 +42,12 @@ class ImageEncoder {
   // Special tokens around an image's rows that its processor adds to the prompt ("" for none; Nemotron: <img>, </img>)
   virtual std::string image_start() const { return ""; }
   virtual std::string image_end() const { return ""; }
+  // The content-part form the model's chat template renders as its image placeholder (without_image_data
+  // rewrites every image part to it before the template runs): OpenAI's {"type": "image_url", ...} for the
+  // Qwen-family templates; {"type": "image"} where the template matches on that (LFM3-Omni).
+  virtual nlohmann::ordered_json image_part() const {
+    return nlohmann::ordered_json{{"type", "image_url"}, {"image_url", {{"url", "image"}}}};
+  }
   virtual int out_dim() const = 0;        // embedding width (the language model's hidden size)
   virtual Prepared prepare(const Image& im) const = 0;      // CPU only, thread-safe
   virtual size_t weight_bytes() const = 0;                  // GPU memory of the loaded weights

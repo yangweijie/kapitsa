@@ -41,11 +41,11 @@ struct VitLnParamsX {
 struct Lfm3QkvParams {
   uint32_t rows, r0, N, heads, kv_heads, HD;
 };
-struct Lfm3ConvBxParams {  // lfm3vit_conv_bx: the in_proj row -> the gated B*x plane, x += C
+struct Lfm3ConvBxParams {  // lfm3vit_conv_bx: the in_proj row -> planes' B*x and C
   uint32_t rows, r0, N, H, gh, gw, merge;
 };
-struct Lfm3ConvDwParams {  // lfm3vit_conv_dw: the depthwise 3x3 over the raster planes
-  uint32_t gh, gw, H;
+struct Lfm3ConvDwParams {  // lfm3vit_conv_dw: the depthwise 3x3 gated by C into xn's rows
+  uint32_t gh, gw, H, N;
 };
 
 // The processor's value LUT (rescale + normalize), as the reference processor computes it (float32 steps)
@@ -273,8 +273,8 @@ size_t Lfm3ViT::work_bytes(const Prepared& p) const {
   const size_t H = size_t(c_.hidden), I = inter_pad_, N = size_t(p.height / c_.patch) * size_t(p.width / c_.patch);
   const size_t rc = std::min<size_t>(N, kVitRowChunk);
   const size_t ym = std::max<size_t>(3 * H, c_.proj_hidden);
-  return pixel_buffer_bytes(p.pixels.size()) + N * H * 4 /* x */ + N * H * 2 /* xn */ + 2 * N * H * 2 /* qkv, qg */ +
-         3 * N * H * 4 /* the conv's raster planes */ + rc * ym * 4 /* y */ + rc * I * 2 /* hh */ +
+  return pixel_buffer_bytes(p.pixels.size()) + N * H * 4 /* x */ + N * H * 2 /* xn */ + 3 * N * H * 2 /* qkv, qg, v (broadcast) */ +
+         3 * N * H * 4 /* the conv's raster planes */ + rc * ym * 4 /* y */ + rc * I * 4 /* y3 */ + rc * I * 2 /* hh */ +
          64 * 1024 /* tables */;
 }
 
@@ -313,13 +313,16 @@ void Lfm3ViT::encode(const Prepared& p, const Buffer& out) {
   Buffer x = alloc(size_t(N) * H * 4, "vit_x");       // fp32 [N, H] residual stream
   Buffer xn = alloc(size_t(N) * H * 2, "vit_xn");     // half normed rows
   Buffer qkv = alloc(size_t(2) * N * H * 2, "vit_qkv");  // half [2H] per row (q | k | v padded)
+  Buffer vb = alloc(size_t(N) * H * 2, "vit_vb");        // half V, all 16 query heads (the kv broadcast)
   Buffer qg = alloc(size_t(N) * H * 2, "vit_qg");     // half Q after q-norm + rope
-  Buffer kg = alloc(size_t(N) * H / 2 * 2, "vit_kg");  // half K after k-norm + rope [NKV heads]
-  Buffer planes = alloc(3 * size_t(N) * H * 4, "vit_planes");  // the conv's raster planes (fp32)
+  Buffer kg = alloc(size_t(N) * H * 2, "vit_kg");  // half K after k-norm + rope, all 16 query heads
+                                                   // (the kv broadcast: 8 kv heads written twice)
+  Buffer planes = alloc(2 * size_t(N) * H * 4, "vit_planes");  // the conv's planes: [B*x; C] (fp32)
   Buffer y = alloc(size_t(RC) * YM * 4, "vit_y");
+  Buffer y3 = alloc(size_t(RC) * I * 4, "vit_y3");   // w3's GEMM rows (w1's y is [RC, I] too: two buffers)
   Buffer hh = alloc(size_t(RC) * I * 2, "vit_h");
   const Buffer Qb = qkv.view(0, size_t(N) * H * 2), Kb = qkv.view(size_t(N) * H * 2, size_t(N) * H * 2),
-               Vb = qkv.view(size_t(N) * (H + H / 2) * 2, size_t(N) * H / 2 * 2);
+               Vb = vb;  // V: all 16 query heads (each kv head's rows twice), half [heads][N][HD]
   VitCmds cs;
   // rms norm (eps 1e-5) of `rows` fp32 rows of x into half rows of xn, by `w`
   auto rms = [&](Encoder& e, const Buffer& w, int rows, int r0 = 0, int out_rows = 0) {
@@ -386,7 +389,9 @@ void Lfm3ViT::encode(const Prepared& p, const Buffer& out) {
       }
     } else {
       rms(cs.at(0.01 * N * H / 1e6), B.onw, N);
-      // in_proj (3H per row) -> the gated B*x planes raster [H, gh, gw], depthwise 3x3, back, C*conv*out_proj
+      // The HF operator: out_proj(C * conv(B * x)). Stage 1 writes the B*x and C planes; stage 2 runs
+      // the depthwise 3x3 over planes[0]'s raster gated by planes[1]'s C into xn's rows; out_proj adds
+      // it to the residual stream. (xn is free here: the rms output was consumed by in_proj's GEMM.)
       for (int r0 = 0; r0 < N; r0 += RC) {
         const int rc = std::min(RC, N - r0);
         Encoder& e = cs.at(2.0 * rc * H * 3 * H / 1e9);
@@ -397,22 +402,19 @@ void Lfm3ViT::encode(const Prepared& p, const Buffer& out) {
         e.use(vit_pipe("lfm3vit_conv_bx"));
         e.buf(0, y);
         e.buf(1, planes);
-        e.buf(2, x);
-        e.val(3, cp);
+        e.val(2, cp);
         e.dispatch(uint32_t(H), uint32_t(rc), 1, 1);
       }
       {
         Encoder& e = cs.at(9.0 * N * H / 1e9);
-        const Lfm3ConvDwParams dp{uint32_t(gh), uint32_t(gw), uint32_t(H)};
+        const Lfm3ConvDwParams dp{uint32_t(gh), uint32_t(gw), uint32_t(H), uint32_t(N)};
         e.use(vit_pipe("lfm3vit_conv_dw"));
         e.buf(0, planes);
         e.buf(1, B.csp);
-        e.buf(2, planes.view(size_t(N) * H * 4, size_t(N) * H * 4));
-        e.buf(3, x);
-        e.val(4, dp);
+        e.buf(2, xn);
+        e.val(3, dp);
         e.dispatch(uint32_t(N), uint32_t(H), 1, 1);
       }
-      rms(cs.at(0.01 * N * H / 1e6), B.fnw, N);
       for (int r0 = 0; r0 < N; r0 += RC) {
         const int rc = std::min(RC, N - r0);
         Encoder& e = cs.at(2.0 * rc * H * H / 1e9);
@@ -426,11 +428,10 @@ void Lfm3ViT::encode(const Prepared& p, const Buffer& out) {
       const int rc = std::min(RC, N - r0);
       Encoder& e = cs.at(4.0 * rc * H * I / 1e9);
       vit_gemm(e, B.w1, xn.view(size_t(r0) * H * 2, size_t(rc) * H * 2), uint32_t(H), y, uint32_t(I), rc, false);
-      vit_gemm(e, B.w3, xn.view(size_t(r0) * H * 2, size_t(rc) * H * 2), uint32_t(H),
-               y.view(size_t(RC) * I * 4, size_t(RC) * I * 4), uint32_t(I), rc, false);
+      vit_gemm(e, B.w3, xn.view(size_t(r0) * H * 2, size_t(rc) * H * 2), uint32_t(H), y3, uint32_t(I), rc, false);
       e.use(vit_pipe("lfm3vit_swiglu"));
       e.buf(0, y);
-      e.buf(1, y.view(size_t(RC) * I * 4, size_t(RC) * I * 4));
+      e.buf(1, y3);
       e.buf(2, hh);
       e.val(3, uint32_t(rc) * I);
       e.dispatch((uint32_t(rc) * I + 255) / 256, 1, 1, 256);

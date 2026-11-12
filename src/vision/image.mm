@@ -84,13 +84,13 @@ std::vector<Source> image_sources(const ojson& messages) {
   return out;
 }
 
-ojson without_image_data(const ojson& messages) {
+ojson without_image_data(const ojson& messages, const ojson& part) {
   if (!messages.is_array()) return messages;
   ojson out = messages;
   for (ojson& m : out) {
     if (!m.is_object() || !m.contains("content") || !m["content"].is_array()) continue;
     for (ojson& it : m["content"])
-      if (it.is_object() && is_image_part(it)) it = ojson{{"type", "image_url"}, {"image_url", {{"url", "image"}}}};
+      if (it.is_object() && is_image_part(it)) it = part;
   }
   return out;
 }

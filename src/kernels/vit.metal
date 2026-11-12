@@ -567,33 +567,31 @@ struct Lfm3QkvParams {
   }
 }
 
-// The conv block: the row's in_proj GEMM output (fp32 [3H] = B | C | x) -> the gated B*x raster plane
-// (fp32 [N, H] of `planes`, in merge-block row order; the depthwise kernel permutes to raster), plus
-// x += C (the residual's second third held apart until the conv has run). One threadgroup per row.
+// The conv block, stage 1: the row's in_proj GEMM output (fp32 [3H] = B | C | x) -> planes[0] = B*x and
+// planes[1] = C (the gated conv output is out_proj(C * conv(B*x)); C is kept for stage 2). No residual here.
 struct Lfm3ConvBxParams {
   uint rows, r0, N, H, gh, gw, merge;
 };
 [[kernel]] void lfm3vit_conv_bx(const device float* y [[buffer(0)]], device float* planes [[buffer(1)]],
-                                device float* x [[buffer(2)]], constant Lfm3ConvBxParams& p [[buffer(3)]],
+                                constant Lfm3ConvBxParams& p [[buffer(2)]],
                                 uint2 gid [[thread_position_in_grid]]) {
   const uint c = gid.x, rr = gid.y;
   if (c >= p.H || rr >= p.rows) return;
   const size_t row = size_t(p.r0 + rr);
   const device float* yr = y + row * 3 * p.H;
-  planes[row * p.H + c] = yr[c] * yr[2 * p.H + c];  // B * x
-  x[row * p.H + c] += yr[p.H + c];                  // + C (the gated conv output adds the conv of planes)
+  planes[row * p.H + c] = yr[c] * yr[2 * p.H + c];         // B * x
+  planes[size_t(p.N) * p.H + row * p.H + c] = yr[p.H + c];  // C
 }
 
-// The depthwise 3x3 over the raster planes: planes rows are merge-block ordered, so cell (y, x) of
-// channel c is row lfm3_vit_merge_index(y, x) (the row's (bh, bw, mh, mw)); a zero border. Out into
-// planes' second half (the C*x residual was already added to x by lfm3vit_conv_bx). One thread per
-// (row of the merge-block sequence, channel); the raster is walked through the same permutation.
+// The conv block, stage 2: the depthwise 3x3 over planes[0]'s raster (rows are merge-block ordered, so cell
+// (y, x) of channel c is row lfm3_vit_merge_index(y, x); a zero border), gated by planes[1]'s C, as half rows
+// of `xn` for the out_proj GEMM: xn = C * conv(B * x). One thread per (row of the sequence, channel).
 struct Lfm3ConvDwParams {
-  uint gh, gw, H;
+  uint gh, gw, H, N;
 };
-[[kernel]] void lfm3vit_conv_dw(device float* planes [[buffer(0)]], const device bfloat* w [[buffer(1)]],
-                                device float* out [[buffer(2)]], device float* x [[buffer(3)]],
-                                constant Lfm3ConvDwParams& p [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {
+[[kernel]] void lfm3vit_conv_dw(const device float* planes [[buffer(0)]], const device bfloat* w [[buffer(1)]],
+                                device half* xn [[buffer(2)]], constant Lfm3ConvDwParams& p [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
   const uint r = gid.x, c = gid.y;
   if (r >= p.gh * p.gw || c >= p.H) return;
   const uint mh = r % 2, mw = (r / 2) % 2, rest = r / 4, bw = rest % (p.gw / 2), bh = rest / (p.gw / 2);
@@ -608,8 +606,8 @@ struct Lfm3ConvDwParams {
       const uint src = ((bh2 * (p.gw / 2) + bw2) * 2 + mh2) * 2 + mw2;
       acc += planes[size_t(src) * p.H + c] * float(wc[uint(dy + 1) * 3 + uint(dx + 1)]);
     }
-  out[size_t(r) * p.H + c] = acc;
-  x[size_t(r) * p.H + c] += acc;  // the operator's residual: h += C * conv(B * x)
+  const float gated = planes[size_t(p.N) * p.H + size_t(r) * p.H + c] * acc;  // C * conv(B * x)
+  xn[size_t(r) * p.H + c] = half(gated);
 }
 
 // silu(w1) * w3 (the SwiGLU; the towers' MLP of both block kinds)

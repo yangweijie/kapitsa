@@ -7,6 +7,7 @@
 #include "util/json_file.h"
 #include "util/log.h"
 #include "model/lfm3_config.h"
+#include "vision/embed.h"
 
 #include <algorithm>
 #include <numeric>
@@ -811,6 +812,7 @@ void Lfm3::encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingPar
   const uint32_t QD = uint32_t(cfg_.hq) * uint32_t(cfg_.hd), KD = uint32_t(cfg_.hkv) * uint32_t(cfg_.hd);
   if (pos0 + T > s.cap && !reserve(s, pos0 + T)) fatal("context full (%d)", s.cap);
   embed(e, s.tok, pos0, T, px_);
+  if (s.embeds) vision::enc_embed_runs(e, *s.embeds, pos0, T, px_, int(H));  // image rows (a prompt's prefill)
   // LFM3_X_PROBE: a per-layer copy of the residual stream's last row, read back after the commit
   // (xprobe_dump); the layerwise bisect for the run-to-run logit wobble
   static const bool xprobe = getenv("LFM3_X_PROBE") && atoi(getenv("LFM3_X_PROBE"));

@@ -258,9 +258,11 @@ std::string chat_template_source(const std::string& model_dir);
 // A request's prompt by a chat template (Engine::render; CPU only, no model needed: tools/api_test checks it).
 // `images`: image parts render as images (their data left out; the engine puts the images' rows in place), else image
 // and video parts become a short note. `native`: the template renders every role and tool call itself (Flint's), so
-// no minja polyfills and system messages after the first stay where they are.
+// no minja polyfills and system messages after the first stay where they are. `image_part`: the content-part form the
+// model's template renders as its image placeholder (ImageEncoder::image_part(); the Qwen family's image_url default).
 std::string render_chat(const minja::chat_template& tmpl, const ChatRequest& r, bool add_generation_prompt,
-                        bool images = false, bool native = false);
+                        bool images = false, bool native = false,
+                        const ojson& image_part = ojson{{"type", "image_url"}, {"image_url", {{"url", "image"}}}});
 // Flint's chat template rewritten for minja (engine.cpp)
 std::string flint_template(std::string src);
 // A request followed by its answer as the client sends it back (content, and the reasoning when the client sends
