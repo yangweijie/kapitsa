@@ -405,6 +405,11 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   think_close_ = tok_.find("</think>");
   tc_open_ = tok_.find("<tool_call>");
   tc_close_ = tok_.find("</tool_call>");
+  // LFM3-Omni: the model opens its turn with audio markers (the speech side this engine does not run);
+  // the markers are dropped from the text output, the speech codes between them too (the text reply
+  // follows the span)
+  audio_start_ = tok_.find("<|audio_start|>");
+  audio_end_ = tok_.find("<|audio_end|>");
   if (nh_) {
     // Nemotron Nano 9B v2: its tokenizer has no <think> or tool-call tokens (the tags are text; its calls
     // <TOOLCALL>[{"name": ..., "arguments": ...}]</TOOLCALL>), and its template switches thinking with "/think" /
@@ -3387,6 +3392,8 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       }
     }
     if (parser.in_think()) ++res.reasoning_tokens;
+    if ((audio_start_ >= 0 && t == audio_start_) || (audio_end_ >= 0 && t == audio_end_))
+      return finish.empty();  // LFM3-Omni: the audio markers dropped; the text reply follows them
     ChatDelta d = parser.push(t);
     stop_filter.filter(d.content);
     if (!stop_filter.matched().empty()) {
