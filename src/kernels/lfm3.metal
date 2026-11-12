@@ -385,3 +385,25 @@ struct Lfm3AttnPSplitParams {
     og[p.D + d] = g;
   }
 }
+
+// The request's repetition penalty (Splash's name, honoured by LFM3): scatter the HF penalty onto the context
+// tokens' logits, before the top-k. A positive logit is divided, a negative multiplied (HF's formula); one thread
+// per context token [base, base+n), so a token that recurs is penalised more than once, which is what breaks a
+// degenerate loop. Dispatched only when the penalty > 1.0, so the default (1.0) leaves the pipeline untouched.
+struct Lfm3RepPenParams {
+  uint32_t base;
+  uint32_t n;
+  float penalty;
+};
+[[kernel]] void lfm3_rep_penalty(device float* logits [[buffer(0)]],
+                                 const device int* tok [[buffer(1)]],
+                                 constant Lfm3RepPenParams& p [[buffer(2)]],
+                                 uint tx [[thread_position_in_threadgroup]],
+                                 uint tg [[threadgroup_position_in_grid]],
+                                 uint ntg [[threads_per_threadgroup]]) {
+  const uint i = tg * ntg + tx;
+  if (i >= p.n) return;
+  const int g = tok[p.base + i];
+  const float lg = logits[g];
+  logits[g] = lg > 0.0f ? lg / p.penalty : lg * p.penalty;
+}
