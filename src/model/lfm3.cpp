@@ -228,6 +228,12 @@ struct Lfm3AttnPParams {
   uint32_t T, Hq, Hkv, D, cap, pos0, window;
   float scale;
 };
+// The request's repetition penalty (lfm3_rep_penalty): scatter the HF penalty onto the last `n` response tokens of
+// s.tok (base = s.cap - n), before the top-k. Duplicates reinforce. Mirrored in lfm3.metal.
+struct Lfm3RepPenParams {
+  uint32_t base, n;
+  float penalty;
+};
 
 Lfm3::Lfm3(const std::string& path, int prefill_chunk) : path_(path) {
   cfg_ = read_config(path);
@@ -654,6 +660,17 @@ void Lfm3::enc_sample(Encoder& e, Seq& s, const Buffer& xrow, int out_index, con
   to_half(e, xrow, nullptr, xh_, 1);
   lin(e, embed_, xh_, logits_, 1, false, 0);  // the tied head
   enc_logit_mask(e, s, logits_, 1, cfg_.vocab, cfg_.vocab);
+  // The request's repetition penalty (Splash's name, honoured here): scatter the HF penalty onto every context
+  // token's logit [0, out_index) of s.tok, before the top-k. Skipped when it is 1.0, so the default pipeline and
+  // its outputs stay bit-exact; a > 1.0 opt-in breaks degenerate repeats (a token that recurs is hit again).
+  if (sp.repetition_penalty > 1.0f && out_index > 0) {
+    const Lfm3RepPenParams rp{0, uint32_t(out_index), sp.repetition_penalty};
+    e.use(pipe("lfm3_rep_penalty"));
+    e.buf(0, logits_);
+    e.buf(1, s.tok);
+    e.val(2, rp);
+    e.dispatch((uint32_t(out_index) + 255) / 256, 1, 1, 256);
+  }
   const uint32_t K = sp.temperature > 0 ? uint32_t(std::clamp(sp.top_k <= 0 ? 32 : sp.top_k, 1, 32)) : 1u;
   const uint32_t V = uint32_t(cfg_.vocab), ntg = (V + 2047) / 2048;
   const kp::TopkStage ts{V, K, 2048};

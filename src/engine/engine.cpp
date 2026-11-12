@@ -2905,6 +2905,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   sp.top_p = r.top_p;
   sp.top_k = r.top_k;
   sp.seed = r.seed ? r.seed : uint32_t(std::random_device{}());
+  sp.repetition_penalty = r.repetition_penalty;  // the request's (Splash's) name; the models that honour it (LFM3) apply it
   // Structured output: the matcher's state. A reply held from its first token samples that token (in the prompt's last
   // chunk) under the grammar's first mask; with reasoning on the grammar starts after </think>.
   GrammarState gst;
