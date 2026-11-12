@@ -33,6 +33,9 @@ class VitWeights {
  public:
   ~VitWeights();
   void open(const std::string& dir, const std::string& prefix);  // the headers only (of the files that hold them)
+  // The same, but the tower's files are named by `extra_files` too (an encoder whose tensors live in a
+  // file the model index does not list: the LFM3 mmproj import's vision.safetensors)
+  void open(const std::string& dir, const std::string& prefix, const std::vector<std::string>& extra_files);
   void close();                                                  // the headers go, the buffers stay
   const Tensor* find(const std::string& name) const;             // by the name after the prefix
   // A bf16 copy of a tensor (bf16, f16 or f32 in the file) into dst: `rows` rows of k values become rows of ld values
