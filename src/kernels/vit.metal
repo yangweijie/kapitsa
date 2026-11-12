@@ -459,3 +459,165 @@ struct RadioShuffleParams {
     yr[k] = half(float(w[k]) * (v * r));
   }
 }
+
+// ---- the LFM3 tower's kernels (the math is pinned in lfm3_vit_ref.h; each diffs against it) ----
+
+// T5-style RMSNorm of `rows` fp32 rows of x (x_ld floats apart) into half rows of y (y_ld):
+// w * x * rsqrt(mean(x^2) + eps), the variance in fp32. One threadgroup of 256 per 8 rows.
+struct VitRmsParams {
+  uint rows, D, x_ld, y_ld;
+  float eps;
+};
+[[kernel]] void vit_rms(device float* x [[buffer(0)]], const device bfloat* w [[buffer(1)]],
+                        device half* y [[buffer(2)]], constant VitRmsParams& p [[buffer(3)]],
+                        uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+  const uint r = tg * 8 + tid / 32, lane = tid % 32;
+  if (r >= p.rows) return;
+  const device float* xr = x + size_t(r) * p.x_ld;
+  device half* yr = y + size_t(r) * p.y_ld;
+  float ss = 0.0f;
+  for (uint c = lane; c < p.D; c += 32) ss += xr[c] * xr[c];
+  ss = simd_sum(ss);
+  const float scale = metal::precise::rsqrt(ss / float(p.D) + p.eps);
+  for (uint c = lane; c < p.D; c += 32) yr[c] = half(float(w[c]) * (xr[c] * scale));
+}
+
+// half [D] rows -> fp32 (the patchifier's embedding_norm output starts the residual stream in fp32)
+[[kernel]] void vit_f32_from_h(const device half* x [[buffer(0)]], device float* y [[buffer(1)]],
+                               constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i < n) y[i] = float(x[i]);
+}
+
+// The attention block's q|k|v GEMM row (fp32 [2H]: q [H], k [H/2], v [H/2] zero-padded) + bias -> half
+// Q, K, V head-major [heads][N][HD], with per-head QK RMSNorm (eps from the tower) and the axial 2D
+// rope over the full HD (rotate_half pairs i <-> i+HD/2; the (h, w) coords are the row's merge-block
+// position). GQA 16/8 is served by WRITING K and V to all 16 query heads: each kv head's rows twice,
+// so vit_attention runs unchanged (kv 8 heads would need a kernel edit). One threadgroup per row,
+// 256 threads cover the 16 query heads' HD columns; the rope's freq table is 16 floats (HD/4).
+struct Lfm3QkvParams {
+  uint rows, r0, N, heads, kv_heads, HD;
+};
+[[kernel]] void lfm3vit_qkv_split(const device float* y [[buffer(0)]], const device bfloat* bias [[buffer(1)]],
+                                  device half* Q [[buffer(2)]], device half* K [[buffer(3)]],
+                                  device half* V [[buffer(4)]], const device bfloat* qn [[buffer(5)]],
+                                  const device bfloat* kn [[buffer(6)]], const device int* pos [[buffer(7)]],
+                                  const device float* invf [[buffer(8)]], device half* Qg [[buffer(9)]],
+                                  device half* Kg [[buffer(10)]], constant Lfm3QkvParams& p [[buffer(11)]],
+                                  uint tg [[threadgroup_position_in_grid]]) {
+  const uint r = tg;
+  if (r >= p.rows) return;
+  const device float* yr = y + size_t(r) * 2 * p.heads * p.HD;  // q [H] | k [H/2] | v [H/2] (padded to H)
+  const int ph = pos[size_t(p.r0 + r) * 2], pw = pos[size_t(p.r0 + r) * 2 + 1];
+  float cosv[32], sinv[32];
+  const uint axis = p.HD / 4;
+  for (uint i = 0; i < axis; ++i) {
+    const float a = float(ph) * invf[i], b = float(pw) * invf[i];
+    cosv[i] = cos(a);
+    sinv[i] = sin(a);
+    cosv[axis + i] = cos(b);
+    sinv[axis + i] = sin(b);
+    cosv[2 * axis + i] = cosv[i];
+    sinv[2 * axis + i] = sinv[i];
+    cosv[3 * axis + i] = cosv[axis + i];
+    sinv[3 * axis + i] = sinv[axis + i];
+  }
+  const uint NH = p.heads, HD = p.HD, NKH = NH / p.kv_heads;
+  // q heads: RMSNorm (head_dim 64, eps folded into the scale by the caller's w? no: eps 1e-5 like the
+  // tower's) then rope, into Qg; also plain Q (unused downstream) into Q for the layout's sake
+  for (uint h = 0; h < NH; ++h) {
+    const device float* qh = yr + size_t(h) * HD;
+    float ss = 0.0f;
+    for (uint d = 0; d < HD; ++d) ss += qh[d] * qh[d];
+    const float scale = metal::precise::rsqrt(ss / float(HD) + 1e-5f);
+    device half* Qh = Qg + (size_t(h) * p.N + p.r0 + r) * HD;
+    for (uint d = 0; d < HD; ++d) {
+      const float v = float(qn[d]) * (qh[d] * scale);
+      const uint j = d < HD / 2 ? d : d - HD / 2;
+      const float a = v, b = d < HD / 2 ? -qh[d + HD / 2] * float(qn[d + HD / 2]) * scale : qh[d - HD / 2] * float(qn[d - HD / 2]) * scale;
+      Qh[d] = half(a * cosv[j] + ((d < HD / 2) ? -b : b) * sinv[j]);
+    }
+    device half* Qr = Q + (size_t(h) * p.N + p.r0 + r) * HD;
+    for (uint d = 0; d < HD; ++d) Qr[d] = half(qh[d]);
+  }
+  // k heads: norm + rope, each written to its NKH query-head copies
+  for (uint hk = 0; hk < p.kv_heads; ++hk) {
+    const device float* kh = yr + size_t(NH) * HD + size_t(hk) * HD;
+    float ss = 0.0f;
+    for (uint d = 0; d < HD; ++d) ss += kh[d] * kh[d];
+    const float scale = metal::precise::rsqrt(ss / float(HD) + 1e-5f);
+    for (uint c = 0; c < NKH; ++c) {
+      device half* Kh = Kg + (size_t(hk * NKH + c) * p.N + p.r0 + r) * HD;
+      device half* Kr = K + (size_t(hk * NKH + c) * p.N + p.r0 + r) * HD;
+      for (uint d = 0; d < HD; ++d) {
+        const float v = float(kn[d]) * (kh[d] * scale);
+        const float a = v, b = d < HD / 2 ? -kh[d + HD / 2] * float(kn[d + HD / 2]) * scale : kh[d - HD / 2] * float(kn[d - HD / 2]) * scale;
+        const uint j = d < HD / 2 ? d : d - HD / 2;
+        Kh[d] = half(a * cosv[j] + ((d < HD / 2) ? -b : b) * sinv[j]);
+        Kr[d] = half(kh[d]);
+      }
+    }
+  }
+  // v heads: no norm, no rope; broadcast to the query-head copies
+  for (uint hv = 0; hv < p.kv_heads; ++hv) {
+    const device float* vh = yr + size_t(NH + p.kv_heads) * HD + size_t(hv) * HD;
+    for (uint c = 0; c < NKH; ++c) {
+      device half* Vh = V + (size_t(hv * NKH + c) * p.N + p.r0 + r) * HD;
+      for (uint d = 0; d < HD; ++d) Vh[d] = half(vh[d]);
+    }
+  }
+}
+
+// The conv block: the row's in_proj GEMM output (fp32 [3H] = B | C | x) -> the gated B*x raster plane
+// (fp32 [N, H] of `planes`, in merge-block row order; the depthwise kernel permutes to raster), plus
+// x += C (the residual's second third held apart until the conv has run). One threadgroup per row.
+struct Lfm3ConvBxParams {
+  uint rows, r0, N, H, gh, gw, merge;
+};
+[[kernel]] void lfm3vit_conv_bx(const device float* y [[buffer(0)]], device float* planes [[buffer(1)]],
+                                device float* x [[buffer(2)]], constant Lfm3ConvBxParams& p [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+  const uint c = gid.x, rr = gid.y;
+  if (c >= p.H || rr >= p.rows) return;
+  const size_t row = size_t(p.r0 + rr);
+  const device float* yr = y + row * 3 * p.H;
+  planes[row * p.H + c] = yr[c] * yr[2 * p.H + c];  // B * x
+  x[row * p.H + c] += yr[p.H + c];                  // + C (the gated conv output adds the conv of planes)
+}
+
+// The depthwise 3x3 over the raster planes: planes rows are merge-block ordered, so cell (y, x) of
+// channel c is row lfm3_vit_merge_index(y, x) (the row's (bh, bw, mh, mw)); a zero border. Out into
+// planes' second half (the C*x residual was already added to x by lfm3vit_conv_bx). One thread per
+// (row of the merge-block sequence, channel); the raster is walked through the same permutation.
+struct Lfm3ConvDwParams {
+  uint gh, gw, H;
+};
+[[kernel]] void lfm3vit_conv_dw(device float* planes [[buffer(0)]], const device bfloat* w [[buffer(1)]],
+                                device float* out [[buffer(2)]], device float* x [[buffer(3)]],
+                                constant Lfm3ConvDwParams& p [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {
+  const uint r = gid.x, c = gid.y;
+  if (r >= p.gh * p.gw || c >= p.H) return;
+  const uint mh = r % 2, mw = (r / 2) % 2, rest = r / 4, bw = rest % (p.gw / 2), bh = rest / (p.gw / 2);
+  const int y = int(bh * 2 + mh), xx = int(bw * 2 + mw);
+  const device bfloat* wc = w + size_t(c) * 9;
+  float acc = 0.0f;
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+      const int yy = y + dy, xxx = xx + dx;
+      if (yy < 0 || yy >= int(p.gh) || xxx < 0 || xxx >= int(p.gw)) continue;
+      const uint bh2 = uint(yy) / 2, mh2 = uint(yy) % 2, bw2 = uint(xxx) / 2, mw2 = uint(xxx) % 2;
+      const uint src = ((bh2 * (p.gw / 2) + bw2) * 2 + mh2) * 2 + mw2;
+      acc += planes[size_t(src) * p.H + c] * float(wc[uint(dy + 1) * 3 + uint(dx + 1)]);
+    }
+  out[size_t(r) * p.H + c] = acc;
+  x[size_t(r) * p.H + c] += acc;  // the operator's residual: h += C * conv(B * x)
+}
+
+// silu(w1) * w3 (the SwiGLU; the towers' MLP of both block kinds)
+[[kernel]] void lfm3vit_swiglu(const device float* a [[buffer(0)]], const device float* b [[buffer(1)]],
+                               device half* h [[buffer(2)]], constant uint& n [[buffer(3)]],
+                               uint i [[thread_position_in_grid]]) {
+  if (i < n) {
+    const float v = a[i];
+    h[i] = half(v / (1.0f + exp(-v)) * b[i]);
+  }
+}
