@@ -508,7 +508,7 @@ struct Lfm3QkvParams {
   if (r >= p.rows) return;
   const device float* yr = y + size_t(r) * 2 * p.heads * p.HD;  // q [H] | k [H/2] | v [H/2] (padded to H)
   const int ph = pos[size_t(p.r0 + r) * 2], pw = pos[size_t(p.r0 + r) * 2 + 1];
-  float cosv[32], sinv[32];
+  float cosv[64], sinv[64];  // the doubled angle table over the full head dim (HD/4 per quarter: 4*16 = 64)
   const uint axis = p.HD / 4;
   for (uint i = 0; i < axis; ++i) {
     const float a = float(ph) * invf[i], b = float(pw) * invf[i];
@@ -532,9 +532,10 @@ struct Lfm3QkvParams {
     device half* Qh = Qg + (size_t(h) * p.N + p.r0 + r) * HD;
     for (uint d = 0; d < HD; ++d) {
       const float v = float(qn[d]) * (qh[d] * scale);
-      const uint j = d < HD / 2 ? d : d - HD / 2;
-      const float a = v, b = d < HD / 2 ? -qh[d + HD / 2] * float(qn[d + HD / 2]) * scale : qh[d - HD / 2] * float(qn[d - HD / 2]) * scale;
-      Qh[d] = half(a * cosv[j] + ((d < HD / 2) ? -b : b) * sinv[j]);
+      // the angle table is already doubled ([h, w, h, w] over the full HD): index it by d directly,
+      // with the partner at d+32 / d-32 carrying rotate_half's sign (cat(-x2, x1))
+      const float b = d < HD / 2 ? -qh[d + HD / 2] * float(qn[d + HD / 2]) * scale : qh[d - HD / 2] * float(qn[d - HD / 2]) * scale;
+      Qh[d] = half(v * cosv[d] + b * sinv[d]);
     }
     device half* Qr = Q + (size_t(h) * p.N + p.r0 + r) * HD;
     for (uint d = 0; d < HD; ++d) Qr[d] = half(qh[d]);
@@ -550,9 +551,8 @@ struct Lfm3QkvParams {
       device half* Kr = K + (size_t(hk * NKH + c) * p.N + p.r0 + r) * HD;
       for (uint d = 0; d < HD; ++d) {
         const float v = float(kn[d]) * (kh[d] * scale);
-        const float a = v, b = d < HD / 2 ? -kh[d + HD / 2] * float(kn[d + HD / 2]) * scale : kh[d - HD / 2] * float(kn[d - HD / 2]) * scale;
-        const uint j = d < HD / 2 ? d : d - HD / 2;
-        Kh[d] = half(a * cosv[j] + ((d < HD / 2) ? -b : b) * sinv[j]);
+        const float b = d < HD / 2 ? -kh[d + HD / 2] * float(kn[d + HD / 2]) * scale : kh[d - HD / 2] * float(kn[d - HD / 2]) * scale;
+        Kh[d] = half(v * cosv[d] + b * sinv[d]);  // the doubled angle table, indexed by d (see the q loop)
         Kr[d] = half(kh[d]);
       }
     }
@@ -594,7 +594,9 @@ struct Lfm3ConvDwParams {
                                 uint2 gid [[thread_position_in_grid]]) {
   const uint r = gid.x, c = gid.y;
   if (r >= p.gh * p.gw || c >= p.H) return;
-  const uint mh = r % 2, mw = (r / 2) % 2, rest = r / 4, bw = rest % (p.gw / 2), bh = rest / (p.gw / 2);
+  // row r of the merge-block sequence = ((bh*(gw/2) + bw)*2 + mh)*2 + mw, so mw = r % 2 and
+  // mh = (r / 2) % 2 (NOT the other way: the block's row major order is mh, then mw)
+  const uint mw = r % 2, mh = (r / 2) % 2, rest = r / 4, bw = rest % (p.gw / 2), bh = rest / (p.gw / 2);
   const int y = int(bh * 2 + mh), xx = int(bw * 2 + mw);
   const device bfloat* wc = w + size_t(c) * 9;
   float acc = 0.0f;
