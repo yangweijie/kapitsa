@@ -11,6 +11,7 @@
 #include "splash/runtime.h"
 #include "util/json_file.h"
 #include "util/log.h"
+#include "util/bf16.h"
 
 #include <minja/chat-template.hpp>
 #include <minja/minja.hpp>
@@ -2207,7 +2208,8 @@ std::string Engine::render(const ChatRequest& r, bool add_generation_prompt) con
   const bool images = vision_ != nullptr;  // image parts render as the model's placeholder, else as a note
   // Nemotron Nano 9B v2's template: the request's enable_thinking (every API's switch) as its "/think" / "/no_think"
   if (think_flags_ && r.template_kwargs.contains("enable_thinking"))
-    return render_chat(*tmpl_, think_flag_request(r), add_generation_prompt, images);
+    return render_chat(*tmpl_, think_flag_request(r), add_generation_prompt, images, false,
+                        vision_->encoder().image_part());
   if (nh_ || dory_) {
     // Nemotron 3.5's (and Dory's) template names two switches its own way: medium_effort (shorter reasoning) for the low and medium
     // reasoning efforts, and truncate_history_thinking = false for preserve_thinking (every turn's reasoning kept, as
@@ -2221,10 +2223,10 @@ std::string Engine::render(const ChatRequest& r, bool add_generation_prompt) con
       ChatRequest q = r;
       if (effort) q.template_kwargs["medium_effort"] = true;
       if (keep) q.template_kwargs["truncate_history_thinking"] = false;
-      return render_chat(*tmpl_, q, add_generation_prompt, images);
+      return render_chat(*tmpl_, q, add_generation_prompt, images, flint_ != nullptr, vision_->encoder().image_part());
     }
   }
-  return render_chat(*tmpl_, r, add_generation_prompt, images, flint_ != nullptr);
+  return render_chat(*tmpl_, r, add_generation_prompt, images, flint_ != nullptr, vision_->encoder().image_part());
 }
 
 // Flint's chat template is written for Jinja2, and minja (third_party, not edited) differs from it in three places the
@@ -2289,10 +2291,10 @@ static ojson flatten_content(const ojson& messages) {
 }
 
 std::string render_chat(const minja::chat_template& tmpl, const ChatRequest& r, bool add_generation_prompt,
-                        bool images, bool native) {
+                        bool images, bool native, const ojson& image_part) {
   minja::chat_template_inputs in;
   int dropped = 0;
-  in.messages = images ? vision::without_image_data(r.messages) : without_images(r.messages, &dropped);
+  in.messages = images ? vision::without_image_data(r.messages, image_part) : without_images(r.messages, &dropped);
   if (!images && string_content_template(tmpl)) in.messages = flatten_content(in.messages);
   if (dropped && add_generation_prompt) logi("chat: %d image(s) left out: this model can't read images", dropped);
   // A system message after the first message (an agent's hook output, a mode change) is a system turn where it
@@ -4746,7 +4748,7 @@ void Engine::remember_reply(const ChatRequest& r, const ChatResult& res) {
   if (!answered_.empty() && answered_.back()->slot == res.slot && answered_.back()->slot_gen == res.slot_gen) return;
   auto a = std::make_shared<Answered>();
   a->r = r;
-  a->r.messages = vision::without_image_data(r.messages);  // (renders the same: the engine renders images this way)
+  a->r.messages = vision::without_image_data(r.messages, vision_->encoder().image_part());  // (renders the same)
   a->r.live = nullptr;
   a->r.grammar = nullptr;
   a->content = res.content;

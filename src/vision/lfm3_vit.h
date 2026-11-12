@@ -43,6 +43,12 @@ class Lfm3ViT : public ImageEncoder {
   std::string name() const override { return "LFM3 ViT"; }
   std::string describe() const override;
   int placeholder() const override { return c_.image_token; }
+  // The chat template wraps one <|image|> in these (the engine expands the placeholder to the
+  // image's rows between them)
+  std::string image_start() const override { return "<|vision_start|>"; }
+  std::string image_end() const override { return "<|vision_end|>"; }
+  // The Omni template's parse_content matches type == "image" (an image_url part falls to its tojson else)
+  nlohmann::ordered_json image_part() const override { return nlohmann::ordered_json{{"type", "image"}}; }
   int out_dim() const override { return c_.out_hidden; }
   Prepared prepare(const Image& im) const override;
   size_t weight_bytes() const override;
