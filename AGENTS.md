@@ -50,7 +50,7 @@ SDK build the named targets, as CI does.
 
 CPU tests (no model, no GPU), after building `kapitsa api_test execution_session_test http_stream_test bench_test
 update_test prefix_cache_test kflash_cache_test grammar_test structured_check fn_store_test fn_dflash_test drafter_attach_test tokenizer_test iq_layout_test
-exl3_test remote_test cluster_test split_place_test gemm_slices_test ffn_share_test device_profile_test qwen4_config_test lfm3_config_test gguf_lfm3_test lfm3_test nh_quant_q8_test json_file_test serve_options_test events_test control_test engine_view_test systemone systemone_test
+exl3_test remote_test cluster_test split_place_test gemm_slices_test ffn_share_test device_profile_test qwen4_config_test lfm3_config_test gguf_lfm3_test lfm3_test lfm3_vit_ref_test lfm3_vit_kernel_check nh_quant_q8_test json_file_test serve_options_test events_test control_test engine_view_test systemone systemone_test
 systemone_codes_probe_test systemone_codes_driver splash_protocol_test splash_runtime_test splash_discover_test splash_plan_test logit_dump`:
 
 ```bash
@@ -72,6 +72,8 @@ build/qwen4_config_test                      # what a Qwen 4 config asks that Fl
 build/lfm3_config_test                       # what an LFM3 config asks that the LFM3 path does not run (src/model/lfm3_config.h)
 build/gguf_lfm3_test                         # an lfm3 GGUF's import: schedule from the per-layer arrays, names, config, tokenizer (synthetic file)
 build/lfm3_test                              # the LFM3 backend's CPU core: read_config, the memory plan, the cache sizing
+build/lfm3_vit_ref_test                      # the Omni vision tower's geometry/rotary CPU oracle (src/vision/lfm3_vit_ref.h)
+build/lfm3_vit_kernel_check --cpu            # the vision kernels' CPU references + params layout (CI mode; `kernels` needs the GPU lock, below)
 build/nh_quant_q8_test                       # Q8 load quantization: code/half-scale bytes, rounding, fallback and guards (CPU only)
 build/json_file_test                         # config.json parsed once per file (src/util/json_file.h)
 build/affine_pack_test                       # MLX affine pack helpers: bit width from shapes, f16 -> bf16 (src/model/affine_pack.h)
@@ -148,6 +150,9 @@ Everything else needs a model folder, often the GPU too (`parser_test MODEL_DIR`
 `batch_check`, `ni_v8check`, `tests/test_server.py URL`, `tests/test_disk_cache.py`, `tests/test_draft.py`,
 `tests/test_structured.py URL`, `logit_mask_check`, `split_check`, `tests/test_split.py`, `tests/test_pair.py`,
 `tests/test_ane_split_abort.py`, `tests/test_systemone.py`, `tests/test_sampled_tokens.py`): run it only when allowed, and report it as run.
+The tiny-tensor GPU kernel checks take no model folder but do take the GPU: `lfm3_vit_kernel_check kernels`
+under `lockf -k /tmp/kapitsa-gpu.lock` with `MTL_SHADER_VALIDATION=1 MTL_DEBUG_LAYER=1`, as
+`lfm3_kernel_check kernels` does.
 
 Lint: `uv tool install prek && prek install` once, then `prek run --all-files` (the same hooks CI runs).
 
