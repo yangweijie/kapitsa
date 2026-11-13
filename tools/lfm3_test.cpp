@@ -148,11 +148,119 @@ int main() {
   ok("plan: an unquantized folder is bf16", bm.formats == "bf16" &&
                                                bm.decode_bytes == params * 2 && bm.head_row_bytes == H * 2);
 
-  // what the engine refuses, precisely (src/engine/engine.cpp, unsupported_model): a runnable LFM3 waits for the
-  // backend, and an unsupported setting is refused alone
+  // the zero-tail RoPE tables the attention kernels will take (modeling_lfm3.py's formula, checked exactly):
+  // the global layers' 32 real frequencies then 32 zeros; the sliding layers' 64 real ones
+  {
+    const std::vector<float> g = ni::lfm3_rope_freqs(1e6, 0.5, 128);
+    bool gok = g.size() == 64 && g[0] == 1.f;
+    for (int i = 0; i < 32 && gok; ++i) gok = g[size_t(i)] == float(std::pow(1e6, -2.0 * i / 128.0));
+    for (int i = 32; i < 64 && gok; ++i) gok = g[size_t(i)] == 0.f;
+    ok("rope: the global table is 32 real frequencies then 32 zeros", gok);
+    const std::vector<float> s = ni::lfm3_rope_freqs(1e4, 1.0, 128);
+    bool sok = s.size() == 64 && s[0] == 1.f;
+    for (int i = 0; i < 64 && sok; ++i) sok = s[size_t(i)] == float(std::pow(1e4, -2.0 * i / 128.0));
+    ok("rope: the sliding table is 64 real frequencies", sok);
+    const std::vector<float> q = ni::lfm3_rope_freqs(1e6, 0.25, 128);
+    bool qok = q.size() == 64 && q[16] == 0.f && q[15] == float(std::pow(1e6, -30.0 / 128.0));
+    for (int i = 16; i < 64 && qok; ++i) qok = q[size_t(i)] == 0.f;
+    ok("rope: a quarter rotation is 16 pairs and a zero tail", qok);
+    const std::vector<float> d = ni::lfm3_rope_freqs(1e6, 1.0, 64);
+    ok("rope: half the head means half the table", d.size() == 32 && d[31] == float(std::pow(1e6, -62.0 / 64.0)));
+    // the tables of the published config, through read_config
+    const std::vector<float> cg = ni::lfm3_rope_freqs(c.theta, c.partial, c.hd);
+    const std::vector<float> cs = ni::lfm3_rope_freqs(c.theta_swa, 1.0, c.hd);
+    ok("rope: the config's two tables", cg == g && cs == s);
+  }
+
+  // the reference conv the Metal kernels will be diffed against: the direct convolution, an explicit ring,
+  // and the decode-stepping equivalence with one prefill
+  {
+    const int C = 5, K = 7, T = 11;
+    std::vector<float> u(size_t(T * C)), w(size_t(C * K)), y(size_t(T * C)), want(size_t(T * C));
+    for (size_t i = 0; i < u.size(); ++i) u[i] = float((i * 37 % 19) - 9) / 4.f;
+    for (size_t i = 0; i < w.size(); ++i) w[i] = float((i * 53 % 11) - 5) / 8.f;
+    // an independent double-precision convolution over an explicit zero-padded sequence
+    std::vector<double> padded(size_t((T + K - 1) * C), 0.0);
+    for (int t = 0; t < T; ++t)
+      for (int c2 = 0; c2 < C; ++c2) padded[size_t(K - 1 + t) * C + c2] = u[size_t(t) * C + c2];
+    for (int t = 0; t < T; ++t)
+      for (int c2 = 0; c2 < C; ++c2) {
+        double acc = 0;
+        for (int k = 0; k < K; ++k) acc += double(w[size_t(c2) * K + k]) * padded[size_t(t + k) * C + c2];
+        want[size_t(t) * C + c2] = float(acc);
+      }
+    ni::lfm3_conv_ref(u.data(), T, C, K, w.data(), nullptr, y.data());
+    ok("conv: the reference is the zero-padded convolution", y == want);
+
+    // an explicit ring of the 6 frames before the sequence (the conv state at a position) shifts the start
+    std::vector<float> ring(size_t((K - 1) * C)), y2(size_t(T * C));
+    for (size_t i = 0; i < ring.size(); ++i) ring[i] = float((i * 29 % 13) - 6) / 3.f;
+    for (int t = 0; t < T; ++t)
+      for (int c2 = 0; c2 < C; ++c2) {
+        double acc = 0;
+        for (int k = 0; k < K; ++k) {
+          const long long src = int64_t(t) - (K - 1 - k);
+          const float x = src >= 0 ? u[size_t(src) * C + c2] : ring[size_t(K - 1 + src) * C + c2];
+          acc += double(w[size_t(c2) * K + k]) * double(x);
+        }
+        y2[size_t(t) * C + c2] = float(acc);
+      }
+    ni::lfm3_conv_ref(u.data(), T, C, K, w.data(), ring.data(), y.data());
+    ok("conv: the ring covers the taps before the sequence", y == y2 && y != want);
+
+    // decode stepping (one frame at a time, the ring rolled) reproduces one prefill exactly
+    std::vector<float> step_ring = ring, ystep(size_t(T * C));
+    for (int t = 0; t < T; ++t) {
+      ni::lfm3_conv_ref(&u[size_t(t) * C], 1, C, K, w.data(), step_ring.data(), &ystep[size_t(t) * C]);
+      std::vector<float> joined(size_t((K - 1 + 1) * C));
+      std::copy(step_ring.begin(), step_ring.end(), joined.begin());
+      std::copy_n(&u[size_t(t) * C], C, joined.begin() + (K - 1) * C);
+      std::copy(joined.begin() + C, joined.end(), step_ring.begin());
+    }
+    ok("conv: decode stepping matches the prefill", ystep == y2);
+  }
+
+  // the rope application reference: the rotated pairs keep the full head's progression, the zero tail's
+  // pairs pass through, position 0 is the identity
+  {
+    const int hd = 128;
+    const std::vector<float> g = ni::lfm3_rope_freqs(1e6, 0.5, hd);
+    std::vector<float> x(size_t(hd), 0.f), out(size_t(hd), 0.f);
+    for (int i = 0; i < hd; ++i) x[size_t(i)] = float((i * 23 % 17) - 8) / 4.f;
+    ni::lfm3_rope_ref(x.data(), hd, g.data(), 3.0, out.data());
+    // the independent expectation: pair i rotates by 3 * freqs[i], computed in double precision
+    bool rot = true, tail = true;
+    for (int i = 0; i < hd / 2; ++i) {
+      const double a = 3.0 * double(g[size_t(i)]), c = std::cos(a), s = std::sin(a);
+      const float e0 = float(double(x[size_t(i)]) * c - double(x[size_t(hd / 2 + i)]) * s);
+      const float e1 = float(double(x[size_t(hd / 2 + i)]) * c + double(x[size_t(i)]) * s);
+      rot = rot && out[size_t(i)] == e0 && out[size_t(hd / 2 + i)] == e1;
+      if (g[size_t(i)] == 0.f)  // the zero tail's pairs are the identity
+        tail = tail && out[size_t(i)] == x[size_t(i)] && out[size_t(hd / 2 + i)] == x[size_t(hd / 2 + i)];
+    }
+    ok("rope: the application matches the per-pair formula", rot);
+    ok("rope: the zero tail's pairs pass through (dims 32-63, 96-127)", tail);
+    bool prog = true;
+    for (int i = 0; i < 32; ++i)
+      prog = prog && g[size_t(i)] == float(std::pow(1e6, -2.0 * i / 128.0));  // the full head's progression
+    ok("rope: the rotated pairs keep the full head's progression (not prefix pairing)", prog);
+    ni::lfm3_rope_ref(x.data(), hd, g.data(), 0.0, out.data());
+    ok("rope: position 0 is the identity", out == x);
+    // the sliding table rotates every pair
+    const std::vector<float> s = ni::lfm3_rope_freqs(1e4, 1.0, hd);
+    ni::lfm3_rope_ref(x.data(), hd, s.data(), 2.5, out.data());
+    bool all = true;
+    for (int i = 0; i < hd / 2; ++i) {
+      const double a = 2.5 * double(s[size_t(i)]), c = std::cos(a), sn = std::sin(a);
+      all = all && out[size_t(i)] == float(double(x[size_t(i)]) * c - double(x[size_t(hd / 2 + i)]) * sn);
+    }
+    ok("rope: the sliding table rotates every pair", all);
+  }
+
+  // what the engine refuses, precisely (src/engine/engine.cpp, unsupported_model): a runnable LFM3 runs, and an
+  // unsupported setting is refused alone
   const std::string runnable = ni::unsupported_model(dir);
-  ok("engine: a runnable LFM3 waits for the backend", runnable.find("does not load models in this build yet") != std::string::npos,
-     runnable);
+  ok("engine: a runnable LFM3 runs", runnable.empty(), runnable);
   json bad = cfg;
   bad["conv_L_cache"] = 4;
   const std::string bpath = base + "/engine-bad";

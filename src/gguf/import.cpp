@@ -393,13 +393,16 @@ Hp read_hp_lfm3(const File& f) {
   }
   h.hkv = attn_hkv;
   if (!attn_hkv) throw Error(file + " has no attention layers (a per-layer head_count_kv of zeros).");
-  // the full-attention partial rotation from the baked zero-tail table (Lfm3Config's default 0.5 without it)
+  // the full-attention partial rotation from the baked zero-tail table (Lfm3Config's default 0.5 without it).
+  // llama.cpp bakes it as an exponent mask: 1 rotates, 1e30 drives the frequency to 0 (unrotated); a plain
+  // zero-tail table has real frequencies and zeros instead. Either way, a rotating pair is neither 0 nor the
+  // 1e30 marker. (LFM3-1.7B-Q4_1's table: 32 ones, 32 x 1e30 — 0.5.)
   h.partial = 0.5;
   if (const Tensor* rf = f.find("rope_freqs.weight"); rf && rf->type == kF32 && rf->ne.size() == 1) {
     std::vector<float> fr(size_t(rf->elements()));
     f.read(*rf, 0, fr.data(), fr.size() * 4);
     int64_t nz = 0;
-    for (float x : fr) nz += x != 0;
+    for (float x : fr) nz += x != 0 && x < 1e10f;
     if (nz && 2 * nz <= h.head_dim) h.partial = double(2 * nz) / double(h.head_dim);
   }
   const Tensor* emb = f.find("token_embd.weight");

@@ -91,6 +91,10 @@ struct SamplingParams {
   float top_p = 1.0f;
   int top_k = 20;
   uint32_t seed = 0;
+  // The request's repetition penalty (HF's, Splash's name): applied by the models that honour it (LFM3, when
+  // > 1.0) before the top-k, scattering the penalty onto the tokens already generated this reply. 1.0: a no-op,
+  // the kernel is skipped and the sampling pipeline is untouched, so default outputs stay bit-exact.
+  float repetition_penalty = 1.0f;
 };
 
 // What a model needs, from its headers only (no weights read): for fit checks before loading and `kapitsa

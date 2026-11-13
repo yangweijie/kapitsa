@@ -718,6 +718,8 @@ class Engine {
   bool preserve_thinking_default_ = false;  // the template has a preserve_thinking switch: on unless the request says
   bool reasoning_effort_template_ = false;  // chat_template has reasoning_effort parameter (e.g. Qwen3.8 default xhigh)
   int think_open_ = -1, think_close_ = -1, tc_open_ = -1, tc_close_ = -1;
+  int audio_start_ = -1, audio_end_ = -1;  // LFM3-Omni: the audio markers dropped from the text
+  bool audio_open_ = false;
   TextTags text_tags_;        // the tags written as text (no such tokens; Nemotron Nano 9B v2)
   bool think_flags_ = false;  // the template switches thinking by "/think" / "/no_think" in a message (Nano 9B v2)
   bool think_ws_ = true;      // the whitespace before </think> stays in the reasoning (Nemotron-H, Dory)
