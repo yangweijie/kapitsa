@@ -44,8 +44,13 @@ struct Source {
 // Throws Error for video parts and for image parts without a usable source.
 std::vector<Source> image_sources(const nlohmann::ordered_json& messages);
 // `messages` with every image part's data replaced by a short stand-in: the template renders the same text without
-// copying megabytes of base64 around.
-nlohmann::ordered_json without_image_data(const nlohmann::ordered_json& messages);
+// copying megabytes of base64 around. The stand-in is `part`, the content-part form the model's chat template
+// renders as its image placeholder (ImageEncoder::image_part(): OpenAI's image_url for the Qwen family,
+// {"type": "image"} for LFM3-Omni).
+nlohmann::ordered_json without_image_data(const nlohmann::ordered_json& messages,
+                                          const nlohmann::ordered_json& part =
+                                              nlohmann::ordered_json{{"type", "image_url"},
+                                                                     {"image_url", {{"url", "image"}}}});
 
 // The encoded bytes of an image source: a data: URL (base64 or percent-encoded) or an http(s) download (size cap,
 // timeout). Throws Error.

@@ -1,6 +1,7 @@
 // The parts of image input every model shares (see encoder.h).
 #include "vision/encoder.h"
 #include "util/log.h"
+#include "vision/lfm3_vit.h"
 #include "vision/qwen_vit.h"
 #include "vision/radio_vit.h"
 
@@ -22,6 +23,12 @@ std::unique_ptr<ImageEncoder> open_encoder(const std::string& dir, long max_pixe
     // patches = pixels / 256, within the processor's 1024 to 13312
     rc.max_pixels = max_pixels == kModelDefaultPixels ? kRadioDefaultMaxPixels : std::max(0L, max_pixels);
     return std::make_unique<RadioViT>(dir, rc);
+  }
+  Lfm3ViTConfig lc;
+  if (Lfm3ViT::supports(dir, &lc)) {
+    if (max_pixels == kModelDefaultPixels) max_pixels = kDefaultImageMaxPixels;
+    if (max_pixels > 0) lc.max_pixels = std::clamp(max_pixels, lc.min_pixels, lc.max_pixels);
+    return std::make_unique<Lfm3ViT>(dir, lc);
   }
   // other models' encoders go here, each behind ImageEncoder, with the model's prefill calling enc_embed_runs
   return nullptr;

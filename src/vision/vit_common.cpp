@@ -70,9 +70,14 @@ std::vector<std::string> vit_tensor_names(const std::string& dir) {
 VitWeights::~VitWeights() { release(); }
 
 void VitWeights::open(const std::string& dir, const std::string& prefix) {
+  open(dir, prefix, {});
+}
+
+void VitWeights::open(const std::string& dir, const std::string& prefix, const std::vector<std::string>& extra_files) {
   prefix_ = prefix;
-  // only the files that hold the tower's tensors (a sharded model's index says which)
-  std::set<std::string> files;
+  // only the files that hold the tower's tensors (a sharded model's index says which); an encoder whose
+  // tensors live outside the index (the LFM3 mmproj import's vision.safetensors) names them as well
+  std::set<std::string> files(extra_files.begin(), extra_files.end());
   const nlohmann::json idx = vit_read_json(dir + "/model.safetensors.index.json");
   if (idx.contains("weight_map") && idx["weight_map"].is_object())
     for (auto& [k, v] : idx["weight_map"].items())
