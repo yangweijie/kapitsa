@@ -372,6 +372,14 @@ int main() {
     ok("tokenizer_config.json: eos_token is the GGUF eos id's vocab string",
        tc.contains("eos_token") && tc["eos_token"].is_string() &&
            tc["eos_token"].get<std::string>() == "<|im_end|>");
+    // the rendered {{ bos_token }} must survive the encode as its own added-token id — a byte-split
+    // here would corrupt the context the same way a missing bos_token does
+    {
+      const std::string bos = tc["bos_token"].get<std::string>();
+      const std::vector<int> ids = tok.encode(bos + "user\nhi");
+      ok("the encoded chat context starts with the bos_token's single added id",
+         !ids.empty() && ids[0] == tok.find(bos) && tok.find(bos) >= 0);
+    }
     ok("the model folder has config.json and model.safetensors",
        !read_json(dir + "/config.json").is_discarded() &&
            std::ifstream(dir + "/model.safetensors").good());
