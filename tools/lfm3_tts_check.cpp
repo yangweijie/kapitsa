@@ -24,15 +24,25 @@ json parse(const std::string& p) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  // bare (the metric's runner): the repo's own checkpoint and oracle; explicit args for CI
+  // bare (the metric's runner): the repo's own checkpoint and oracle; "dir MODEL_DIR" loads the
+  // model folder's audio-gen.safetensors (the imported gen side — the engine's future load path);
+  // explicit args for CI
   const char* ckpt_dir = argc > 2 ? argv[2] : ".lfm3-real/omni-fp32";
   const char* oracle_dir = argc > 3 ? argv[3] : ".lfm3-real/tts-oracle";
-  if (argc > 1 && std::string(argv[1]) != "oracle") {
-    fprintf(stderr, "usage: lfm3_tts_check [oracle [CHECKPOINT_DIR ORACLE_DIR]]\n");
+  std::string gen_file = std::string(ckpt_dir) + "/model.safetensors";
+  if (argc > 1 && std::string(argv[1]) == "dir") {
+    if (argc < 3) {
+      fprintf(stderr, "usage: lfm3_tts_check dir MODEL_DIR [ORACLE_DIR]\n");
+      return 2;
+    }
+    gen_file = std::string(argv[2]) + "/audio-gen.safetensors";
+    if (argc > 3) oracle_dir = argv[3];
+  } else if (argc > 1 && std::string(argv[1]) != "oracle") {
+    fprintf(stderr, "usage: lfm3_tts_check [oracle [CHECKPOINT_DIR ORACLE_DIR]] | dir MODEL_DIR [ORACLE_DIR]\n");
     return 2;
   }
-  fprintf(stderr, "paths: ckpt %s oracle %s (argc %d)\n", ckpt_dir, oracle_dir, argc);
-  const std::string ckpt = std::string(ckpt_dir) + "/model.safetensors";
+  fprintf(stderr, "paths: gen %s oracle %s (argc %d)\n", gen_file.c_str(), oracle_dir, argc);
+  const std::string ckpt = gen_file;
   const json meta = parse(std::string(oracle_dir) + "/inputs.json");
   std::ifstream lg(std::string(oracle_dir) + "/logits.f32", std::ios::binary);
   if (!lg.good()) fprintf(stderr, "no oracle logits (%s): errno %d %s\n",

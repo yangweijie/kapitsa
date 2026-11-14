@@ -561,6 +561,59 @@ def convert(src, out, verify):
     return stats
 
 
+GEN_KEEP = ("model.depth_decoder.", "model.codebook_embedding.")
+GEN_CONFIG_KEYS = ("audio_out_token_id", "audio_start_token_id", "audio_eos_code", "codebook_size",
+                   "num_codebooks", "maskgit_schedule", "audio_temperature", "audio_top_k",
+                   "audio_repetition_penalty", "depth_config", "downsample_factor", "interleaved_n_audio")
+
+
+def convert_gen_depth(hf_dir, out, verify):
+    """The audio GENERATION side from the Omni checkpoint (the GGUF carries no gen tensors): the
+    depth decoder's and codebook_embedding's tensors copied as-is (bf16) into audio-gen.safetensors,
+    plus the generation config keys the engine needs, into audio_gen_config.json."""
+    import json as j
+    with open(os.path.join(hf_dir, "model.safetensors"), "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = j.loads(f.read(n))
+        data_at = 8 + n
+    cfg = j.load(open(os.path.join(hf_dir, "config.json")))
+    kept = {}
+    blobs = []
+    at = 0
+    for name in sorted(hdr):
+        if name == "__metadata__" or not name.startswith(GEN_KEEP):
+            continue
+        t = hdr[name]
+        begin, end = t["data_offsets"]
+        with open(os.path.join(hf_dir, "model.safetensors"), "rb") as f:
+            f.seek(data_at + begin)
+            blobs.append((name, t["dtype"], t["shape"], f.read(end - begin)))
+    for name, dtype, shape, blob in blobs:
+        start = at
+        at += len(blob)
+        kept[name] = {"dtype": dtype, "shape": shape, "data_offsets": [start, at]}
+    head = j.dumps(kept, separators=(",", ":")).encode()
+    pad = (8 - (8 + len(head)) % 8) % 8
+    with open(os.path.join(out, "audio-gen.safetensors"), "wb") as f:
+        f.write(struct.pack("<Q", len(head) + pad))
+        f.write(head)
+        f.write(b" " * pad)
+        for _, _, _, blob in blobs:
+            f.write(blob)
+    gen_cfg = {k: cfg[k] for k in GEN_CONFIG_KEYS if k in cfg}
+    gen_cfg["converted_from"] = os.path.abspath(hf_dir)
+    j.dump(gen_cfg, open(os.path.join(out, "audio_gen_config.json"), "w"), indent=1)
+    print(f"gen side: {len(kept)} tensors ({sum(len(b) for _, _, _, b in blobs)} bytes) -> "
+          f"{out}/audio-gen.safetensors; config keys: {sorted(gen_cfg)}")
+    if verify:
+        with open(os.path.join(out, "audio-gen.safetensors"), "rb") as f:
+            n2 = struct.unpack("<Q", f.read(8))[0]
+            h2 = j.loads(f.read(n2))
+            for name in kept:
+                assert name in h2 and h2[name]["data_offsets"] == kept[name]["data_offsets"], name
+        print(f"verify: {len(kept)} tensors re-read ok")
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -576,11 +629,18 @@ def main():
     p.add_argument("--self-test", action="store_true", help="check the decoder and the name map, no file needed")
     p.add_argument("--verify", action="store_true", help="re-read the output safetensors and check every tensor")
     p.add_argument("--audio", action="store_true", help="convert the audio input path (a.*, mm.a.*) instead of vision")
+    p.add_argument("--gen-depth", metavar="HF_DIR",
+                   help="copy the audio GENERATION side (the depth decoder + codebook_embedding) from an HF "
+                        "checkpoint dir into OUT as audio-gen.safetensors + audio_gen_config.json (the GGUF "
+                        "carries no gen tensors; the Omni checkpoint does)")
     a = p.parse_args()
     if a.self_test:
         self_test()
         if a.src is None:
             return 0
+    if a.gen_depth:
+        convert_gen_depth(a.gen_depth, a.out if a.out else a.src, a.verify)
+        return 0
     if not a.src or not a.out:
         p.error("MMPROJ.gguf and OUT are needed (or just --self-test)")
     if a.audio:
