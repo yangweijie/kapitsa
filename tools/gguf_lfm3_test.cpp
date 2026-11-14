@@ -5,6 +5,9 @@
 // plan mode (config.json and the safetensors headers, no tensor data) and once fully into a KAPITSA_HOME sandbox.
 // CPU only, no model, no GPU.
 #include "gguf/import.h"
+#include "engine/chat.h"
+#include "engine/engine.h"
+#include "minja/chat-template.hpp"
 #include "tokenizer/tokenizer.h"
 
 #include <nlohmann/json.hpp>
@@ -19,7 +22,7 @@
 #include <string>
 #include <vector>
 
-using json = nlohmann::json;
+using json = nlohmann::ordered_json;  // the engine headers' alias (ojson) must match
 using ni::gguf::ImportOptions;
 using ni::gguf::import_model;
 
@@ -379,6 +382,31 @@ int main() {
       const std::vector<int> ids = tok.encode(bos + "user\nhi");
       ok("the encoded chat context starts with the bos_token's single added id",
          !ids.empty() && ids[0] == tok.find(bos) && tok.find(bos) >= 0);
+    }
+    // the no-vision render path (the null-vision call sites' contract, 11b15ec8): render_chat with
+    // images=false turns image parts into the omission note and never looks at the image-part form —
+    // the fixed call sites pass an empty json there for a model without a tower, so both forms of it
+    // must render identically
+    {
+      minja::chat_template tmpl(
+          "{%- for m in messages %}<|im_start|>{{ m.role }}\n"
+          "{%- if m.content is string %}{{ m.content }}{%- else %}{%- for p in m.content %}"
+          "{%- if p.type == 'text' %}{{ p.text }}{%- endif %}{%- endfor %}{%- endif %}<|im_end|>\n"
+          "{%- endfor %}{%- if add_generation_prompt %}<|im_start|>assistant\n<think></think>{%- endif %}",
+          "", "<|im_end|>");
+      ni::ChatRequest q;
+      q.messages = json::parse(
+          R"([{"role": "user", "content": [{"type": "text", "text": "describe"},
+             {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}]}])");
+      const std::string p1 = ni::render_chat(tmpl, q, true, false, false, nlohmann::ordered_json());
+      ok("the no-vision render keeps the text, notes the image, opens the assistant turn",
+         p1.find("describe") != std::string::npos &&
+             p1.find("[image omitted: this model can't read images]") != std::string::npos &&
+             p1.find("assistant") != std::string::npos);
+      const std::string p2 = ni::render_chat(tmpl, q, true, false, false,
+                                        nlohmann::ordered_json{{"type", "image_url"},
+                                                               {"image_url", {{"url", "image"}}}});
+      ok("the no-vision render is image_part-independent", p1 == p2);
     }
     ok("the model folder has config.json and model.safetensors",
        !read_json(dir + "/config.json").is_discarded() &&
