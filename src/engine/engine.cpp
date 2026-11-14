@@ -2625,6 +2625,12 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     if (bt.size() < prompt.size() && std::equal(bt.begin(), bt.end(), prompt.begin())) boundary = int(bt.size());
   }
   if (boundary >= int(prompt.size())) boundary = -1;
+  // The Omni's TTS elicitation: a prompt ending on <|audio_start|> switches the reply to speech
+  // (the reference's generate: "a prompt ending on <|audio_start|> ... switches to speech")
+  if (r.template_kwargs.value("audio_reply", false) && model_->has_tts() && audio_start_ >= 0) {
+    prompt.push_back(audio_start_);
+    logi("tts: <|audio_start|> appended (the audio_reply elicitation)");
+  }
   // images: each placeholder becomes the image's rows; prefix reuse compares keys that tell images apart by content
   vision::Prompt mm;
   const vision::Prompt* mmp = nullptr;
@@ -3444,6 +3450,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   // structured output: </think> ends a speculative loop running the reasoning (g_in_spec), whose drafts and verify
   // know no grammar; the constrained loop below takes the reply from there (g_break)
   bool g_in_spec = false, g_break = false;
+  std::vector<std::vector<int>> speech_frames;  // the TTS frames' codes, in generation order
   // Handles one generated token; returns false when generation must stop (finish is set), or when a speculative loop
   // gives the reply to the constrained loop (g_break).
   auto handle = [&](int t) -> bool {
@@ -3463,6 +3470,24 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       finish = "stop";
       return false;
     }
+    // The Omni's TTS: an audio-out token's position hangs one speech frame — its codes sampled from
+    // the hidden state this token was picked from (the last step's pre-head state).
+    if (model_->has_tts() && t == model_->audio_out_token()) {
+      auto frame = model_->speech_frame(uint64_t(sp.seed) + speech_frames.size());
+      if (frame.empty()) {
+        finish = "error";
+        res.error = "tts: the speech side did not load";
+        return false;
+      }
+      const bool end_of_audio = std::all_of(frame.begin(), frame.end(),
+                                            [eos = model_->audio_eos_code()](int v) { return v == eos; });
+      speech_frames.push_back(std::move(frame));
+      if (end_of_audio) {  // the depth decoder's end-of-audio frame ends the speech
+        finish = "stop";
+        return false;
+      }
+      return finish.empty();  // the audio_out token drops from the text reply
+    }
     if (gm) {
       if (g_on) {
         if (!gm->advance(gst, t)) {  // (the masks allow only what the grammar does: a bug if it happens)
@@ -3477,8 +3502,10 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       }
     }
     if (parser.in_think()) ++res.reasoning_tokens;
-    if ((audio_start_ >= 0 && t == audio_start_) || (audio_end_ >= 0 && t == audio_end_))
+    if ((audio_start_ >= 0 && t == audio_start_) || (audio_end_ >= 0 && t == audio_end_)) {
+      if (t == audio_start_ && model_->has_tts()) model_->set_speech_mode(true);  // the model switched to speech
       return finish.empty();  // LFM3-Omni: the audio markers dropped; the text reply follows them
+    }
     ChatDelta d = parser.push(t);
     stop_filter.filter(d.content);
     if (!stop_filter.matched().empty()) {
@@ -4274,6 +4301,9 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     auto park = [&] {
       if (next) next->wait();
     };
+    // the Omni's TTS: the audio_reply elicitation (or the model's own <|audio_start|>) forces the
+    // speech slots to <|audio_out|>; the frames' codes are sampled in the token handler
+    if (r.template_kwargs.value("audio_reply", false) && model_->has_tts()) model_->set_speech_mode(true);
     if (r.max_tokens > 1) next = encode_at(pos);
     while (true) {
       bool go = handle(s.tokens()[pos]);  // available: produced by the previous command buffer
@@ -4322,6 +4352,8 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     s.mask_event = mask_event_;
     uint32_t* const mw = s.mask.as<uint32_t>();
     const size_t mbytes = size_t(s.mask_words) * 4;
+    // the speech elicitation's first slot: the mask forces <|audio_out|> from the very first step
+    // (the prompt ends on <|audio_start|>; the reference's audio mode forces every slot)
     int pos = switched ? fed_until : n;  // the newest sampled token (not fed yet)
     uint64_t pending = 0;               // the value the queued step's sampler waits for, until signalled
     auto signal = [&] {
@@ -4445,6 +4477,10 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   else if (depth > 0 && spec_cycles_ > 0)
     logd("spec: %.2f accepted/drafted over %ld cycles", double(spec_accepted_) / (spec_cycles_ * depth), spec_cycles_);
   res.decode_ms = now_ms() - t1;
+  if (!speech_frames.empty()) {
+    res.audio_frames = std::move(speech_frames);
+    logi("tts: %d speech frames sampled", int(res.audio_frames.size()));
+  }
   if (trace_path) {  // one line: the prompt (FNV-1a of its ids), the first token, then each cycle's tokens and margins
     uint64_t h = 1469598103934665603ull;
     for (int t : prompt) h = (h ^ uint64_t(uint32_t(t))) * 1099511628211ull;

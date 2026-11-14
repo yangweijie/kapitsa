@@ -99,6 +99,9 @@ struct ChatResult {
   bool engine_down = false;   // "error" because the engine is unavailable: a 503, without Retry-After if permanently dead
   bool engine_restarting = false;  // a local cancellation deadline is replacing the child: a 503 with Retry-After
   int prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;
+  // The speech frames' codes the model generated (the Omni's TTS: one row of 12 codebook codes per
+  // audio-out token, in order) — the codec turns them into the response's audio.
+  std::vector<std::vector<int>> audio_frames;
   int reasoning_tokens = 0;   // completion tokens inside the think block
   double prefill_ms = 0, decode_ms = 0;
   // prefill_ms is the time to read the uncached prompt tokens: no image rows (their encoder runs before the clock

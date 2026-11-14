@@ -3,6 +3,7 @@
 #include "model/kparams.h"
 
 #include <unordered_map>
+#include <fstream>
 
 #include "util/json_file.h"
 #include "util/log.h"
@@ -238,6 +239,17 @@ struct Lfm3RepPenParams {
 
 Lfm3::Lfm3(const std::string& path, int prefill_chunk) : path_(path) {
   cfg_ = read_config(path);
+  // the speech side's availability is known at load (the files' presence + the config keys); the
+  // depth decoder's weights load lazily on the first frame
+  if (std::ifstream(path + "/audio_gen_config.json").good() && std::ifstream(path + "/audio-gen.safetensors").good()) {
+    const nlohmann::json gc = nlohmann::json::parse(std::ifstream(path + "/audio_gen_config.json"), nullptr, false);
+    if (!gc.is_discarded()) {
+      audio_out_token_ = gc.value("audio_out_token_id", -1);
+      audio_eos_code_ = gc.value("audio_eos_code", -1);
+      audio_temperature_ = gc.value("audio_temperature", 0.0f);
+      logi("tts: the speech side is present (audio_out token %d, eos code %d)", audio_out_token_, audio_eos_code_);
+    }
+  }
   if (cfg_.bits != 16 && !((cfg_.gs == 64 && (cfg_.bits == 3 || cfg_.bits == 5 || cfg_.bits == 6 || cfg_.bits == 8)) ||
                            (cfg_.gs == 32 && cfg_.bits == 4)))
     fatal("%s: LFM3 linears in %d-bit group %d, which the qmr kernels do not run (4-bit group 32, 8-bit group 64, "
@@ -439,6 +451,44 @@ void Lfm3::enc_mv1(Encoder& e, const Lfm3Lin& W, const Buffer& x, const Tensor* 
   e.buf(18, norm ? norm->buf : x);
   e.buf(19, x);
   e.dispatch(uint32_t(rows), (W.N + 7) / 8, 1, 64);
+}
+
+// ---- audio OUTPUT (the Omni's TTS) ----
+bool Lfm3::has_tts() const {
+  return audio_out_token_ >= 0;
+}
+
+int Lfm3::audio_eos_code() const {
+  return audio_eos_code_;
+}
+
+void Lfm3::set_speech_mode(bool on) {
+  speech_forced_ = on;
+  if (on && !tts_) load_tts();  // the first speech slot's forcing needs the weights in place
+}
+
+void Lfm3::load_tts() {
+  if (tts_) return;
+  const std::string gen = path_ + "/audio-gen.safetensors";
+  std::ifstream cfg_f(path_ + "/audio_gen_config.json");
+  if (!std::ifstream(gen).good() || !cfg_f.good()) return;
+  const nlohmann::json gc = nlohmann::json::parse(cfg_f, nullptr, false);
+  if (gc.is_discarded()) return;
+  audio_out_token_ = gc.value("audio_out_token_id", -1);
+  audio_eos_code_ = gc.value("audio_eos_code", -1);
+  audio_temperature_ = gc.value("audio_temperature", 0.0f);
+  tts_ = std::make_unique<tts::DepthDecoder>(gen);
+  logi("tts: the depth decoder loaded (%d codebooks, audio_out token %d)", gc.value("num_codebooks", 12),
+       audio_out_token_);
+}
+
+std::vector<int> Lfm3::speech_frame(uint64_t seed) {
+  if (!tts_) load_tts();
+  if (!tts_) return {};
+  // the last step's pre-head state (xn_ holds the final-normed hidden the head read) — read back
+  std::vector<float> hidden(size_t(cfg_.hidden));
+  memcpy(hidden.data(), xn_.as<float>(), hidden.size() * 4);
+  return tts_->sample_frame(hidden, audio_temperature_, seed);
 }
 
 // x's rows through an RMSNorm (norm's weight) into y as halfs; without a norm, plain halfs.
@@ -671,6 +721,17 @@ void Lfm3::enc_sample(Encoder& e, Seq& s, const Buffer& xrow, int out_index, con
     e.buf(1, s.tok);
     e.val(2, rp);
     e.dispatch((uint32_t(out_index) + 255) / 256, 1, 1, 256);
+  }
+  if (speech_forced_ && tts_) {
+    // the speech slots sample no text: the sequence carries <|audio_out|> (the reference's audio
+    // mode), the codes ride this step's hidden state and the engine samples them after the wait
+    static Pipeline wt = Gpu::get().pipeline("lfm3_write_token");
+    e.use(wt);
+    e.buf(0, s.tok);
+    e.val(1, audio_out_token_);
+    e.val(2, uint32_t(out_index));
+    e.dispatch(1, 1, 1, 1);
+    return;
   }
   const uint32_t K = sp.temperature > 0 ? uint32_t(std::clamp(sp.top_k <= 0 ? 32 : sp.top_k, 1, 32)) : 1u;
   const uint32_t V = uint32_t(cfg_.vocab), ntg = (V + 2047) / 2048;

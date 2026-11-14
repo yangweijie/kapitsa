@@ -160,6 +160,19 @@ class Model {
 
   // ---- passes ----
   virtual void encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, uint32_t step, bool sample = true) = 0;
+
+  // ---- audio OUTPUT (the LFM3-Omni's TTS; everything defaults to "not supported") ----
+  // Whether the model carries the speech side (the depth decoder + its config in the model dir).
+  virtual bool has_tts() const { return false; }
+  // The token id whose positions the speech frames hang on (the Omni's audio_out_token_id).
+  virtual int audio_out_token() const { return -1; }
+  // One frame's 12 codebook codes from the hidden state of the last step (the audio-out position's
+  // pre-head state — the same one the LM head read). Empty when the speech side is not loaded.
+  virtual std::vector<int> speech_frame(uint64_t seed) { return {}; }
+  // The codebook code that ends the speech (the depth decoder's end-of-audio frame: all 12 equal it).
+  virtual int audio_eos_code() const { return -1; }
+  // The speech slots force the audio-out token instead of sampling text (the Omni's audio mode).
+  virtual void set_speech_mode(bool on) {}
   virtual void encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingParams& sp, uint32_t step,
                               bool sample, Checkpoint* snap = nullptr, int snap_row = 0) = 0;
   virtual int prefill_chunk() const = 0;

@@ -8,6 +8,7 @@
 // This file holds what needs no GPU: the config, the memory plan from the headers alone, and the cache sizing.
 #pragma once
 #include "loader/safetensors.h"
+#include "vision/lfm3_tts.h"
 #include "model/model.h"
 
 #include <map>
@@ -121,6 +122,16 @@ class Lfm3 : public Model {
   void load();
   Pipeline pipe(const std::string& n);
   void lin(Encoder& e, const Lfm3Lin& W, const Buffer& xh, const Buffer& y, int rows, bool add, uint32_t y_ld);
+  // ---- audio OUTPUT (the Omni's TTS): the depth decoder over the last step's pre-head state ----
+  bool has_tts() const override;
+  int audio_out_token() const override { return audio_out_token_; }
+  int audio_eos_code() const override;
+  std::vector<int> speech_frame(uint64_t seed) override;
+  // The speech slots force <|audio_out|> (the reference's audio mode masks the text head); the
+  // engine samples each frame after the step completes (speech_frame) and ends on the eos frame.
+  void set_speech_mode(bool on) override;
+  void load_tts();
+
   // The decode matvec (rows <= kMaxRows) of a 4-bit group-32 linear: qmvf_b4g32_t1_r4[_norm] reads the
   // fp32 x directly and folds the RMSNorm (norm non-null) — no halfs, no separate norm dispatch.
   void enc_mv1(Encoder& e, const Lfm3Lin& W, const Buffer& x, const Tensor* norm, const Buffer& y, int rows,
@@ -149,6 +160,11 @@ class Lfm3 : public Model {
   Buffer px_, pxh_, pbcx_, pu_, pz_, py_, pmix_, paoh_, pqkv_, pgate_, pq_, pao_, pg_, pu2_, ph_, phh_;
   Buffer ppart_o_, ppart_m_, ppart_s_;  // the prefill attention's split partials
   bool sample_sg_ = false;        // topk_stage1_rows_sg (an Apple10 GPU on macOS 26), as Qwen35 reads it
+  // the speech side, loaded lazily on the first audio-out frame (the weights are the side file)
+  std::unique_ptr<tts::DepthDecoder> tts_;
+  int audio_out_token_ = -1, audio_eos_code_ = -1;
+  float audio_temperature_ = 0.0f;
+  bool speech_forced_ = false;  // the speech slots force <|audio_out|> (the audio mode's mask)
 };
 
 }  // namespace ni

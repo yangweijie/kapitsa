@@ -407,3 +407,10 @@ struct Lfm3RepPenParams {
   const float lg = logits[g];
   logits[g] = lg > 0.0f ? lg / p.penalty : lg * p.penalty;
 }
+
+// the TTS speech mode's forced token: the audio-out slots sample no text — the depth decoder's
+// codes ride the hidden state and the sequence carries <|audio_out|> (the reference's audio mode)
+[[kernel]] void lfm3_write_token(device int* tok [[buffer(0)]], constant int& value [[buffer(1)]],
+                                 constant uint& index [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i == 0) tok[index] = value;
+}
