@@ -1099,6 +1099,66 @@ int main(int argc, char** argv) {
     memcpy(bg.ptr(), gate.data(), gate.size() * 4);
     const uint32_t pos0 = 3, window = 8;
     const Lfm3AttnPParams ap{T, Hq, Hkv, D, cap, pos0, window, scale};
+    // the large-T form the engine's prefill runs (a 512-row chunk's tail + the first chunk): the same
+    // double-precision reference at the real shapes
+    {
+      const uint32_t TL = 1152, cap2 = 8192, pos02 = 2048;
+      std::vector<float> q2(size_t(TL * Hq * D)), g2(size_t(TL * Hq)), o2(size_t(TL * Hq * D), 0.f);
+      std::vector<_Float16> k2(size_t(Hkv * cap2 * D)), v2(size_t(Hkv * cap2 * D));
+      for (auto& v : q2) v = rnd(seed);
+      for (auto& v : g2) v = rnd(seed);
+      for (auto& v : k2) v = _Float16(rnd(seed) / 4.f);
+      for (auto& v : v2) v = _Float16(rnd(seed) / 4.f);
+      ni::Buffer bq2 = gpu.alloc(q2.size() * 4, "Lq"), bk2 = gpu.alloc(k2.size() * 2, "Lkc"),
+                 bv2 = gpu.alloc(v2.size() * 2, "Lvc"), bg2 = gpu.alloc(g2.size() * 4, "Lgate"),
+                 bo2 = gpu.alloc(o2.size() * 4, "Lout");
+      memcpy(bq2.ptr(), q2.data(), q2.size() * 4);
+      memcpy(bk2.ptr(), k2.data(), k2.size() * 2);
+      memcpy(bv2.ptr(), v2.data(), v2.size() * 2);
+      memcpy(bg2.ptr(), g2.data(), g2.size() * 4);
+      const Lfm3AttnPParams ap2{TL, Hq, Hkv, D, cap2, pos02, 8, scale};
+      auto e6 = gpu.begin();
+      e6->use(gpu.pipeline("lfm3_attn_p"));
+      e6->buf(0, bq2);
+      e6->buf(1, bk2);
+      e6->buf(2, bv2);
+      e6->buf(3, bg2);
+      e6->buf(4, bo2);
+      e6->val(5, ap2);
+      e6->dispatch(Hq, TL, 1, 1);
+      e6->commit_and_wait();
+      bool good2 = true;
+      for (uint32_t t = 0; t < TL && good2; t += 97) {  // a sampled subset (the full sweep is the small-T case)
+        const uint32_t pos = pos02 + t, beg = pos >= 8 ? pos + 1 - 8 : 0;
+        for (uint32_t h = 0; h < Hq && good2; ++h) {
+          const _Float16* kkh = k2.data() + uint64_t(h / (Hq / Hkv)) * cap2 * D;
+          const _Float16* vvh = v2.data() + uint64_t(h / (Hq / Hkv)) * cap2 * D;
+          double mx = -1e300;
+          std::vector<double> sc(size_t(pos - beg + 1));
+          for (uint32_t s = beg; s <= pos; ++s) {
+            double acc = 0;
+            for (uint32_t d = 0; d < D; ++d)
+              acc += double(q2[(size_t(t) * Hq + h) * D + d]) * double(kkh[uint64_t(s) * D + d]);
+            sc[size_t(s - beg)] = acc * scale;
+            mx = std::max(mx, sc[size_t(s - beg)]);
+          }
+          double den = 0;
+          for (double v : sc) den += std::exp(v - mx);
+          for (uint32_t d = 0; d < D && good2; ++d) {
+            double acc = 0;
+            for (uint32_t s = beg; s <= pos; ++s)
+              acc += std::exp(sc[size_t(s - beg)] - mx) / den * double(vvh[uint64_t(s) * D + d]);
+            const float want = float(acc * (1.0 / (1.0 + std::exp(-double(g2[size_t(t) * Hq + h])))));
+            const float got = bo2.as<float>()[(size_t(t) * Hq + h) * D + d];
+            if (fabsf(got - want) > 2e-2f * (1.f + fabsf(want))) {
+              fprintf(stderr, "  large-T attn_p diff t%u h%u d%u: %g vs %g\n", t, h, d, got, want);
+              good2 = false;
+            }
+          }
+        }
+      }
+      ok("attn_p: the large-T chunk (T=1152, pos0=2048, window 8)", good2);
+    }
     auto e = gpu.begin();
     e->use(gpu.pipeline("lfm3_attn_p"));
     e->buf(0, bq);
