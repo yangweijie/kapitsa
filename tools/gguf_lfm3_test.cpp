@@ -7,6 +7,7 @@
 #include "gguf/import.h"
 #include "engine/chat.h"
 #include "engine/engine.h"
+#include "vision/image.h"
 #include "minja/chat-template.hpp"
 #include "tokenizer/tokenizer.h"
 
@@ -430,6 +431,51 @@ int main() {
                pa.find("more") != std::string::npos && pa.find("be terse") != std::string::npos &&
                pa.find("assistant") != std::string::npos);
       }
+    }
+    // the audio request side (the Omni's input_audio parts): extraction, the data: URL prefix, the
+    // wav format checks and the error paths — CPU-only, the serve-side end-to-end is the A4 evidence
+    {
+      const std::string riff = "UklGRiQAAAA=" + std::string();  // RIFF + a size, base64
+      ni::ChatRequest q;
+      q.messages = json::parse(R"([{"role": "user", "content": [
+        {"type": "text", "text": "transcribe"},
+        {"type": "input_audio", "input_audio": {"data": "UklGRiQAAAA=", "format": "wav"}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "audio_url", "audio_url": {"data": "UklGRiQAAAA="}}]}])");
+      const auto srcs = ni::vision::audio_sources(q.messages);
+      const auto hexs = [&](const std::string& t) {
+        std::string h;
+        for (unsigned char c : t) {
+          char b[4];
+          snprintf(b, sizeof b, "%02x", c);
+          h += b;
+        }
+        return h;
+      };
+      ok("audio_sources: two audio parts, the image skipped", srcs.size() == 2);
+      ok("audio_sources: the input_audio bytes", hexs(srcs[0].bytes) == "5249464624000000");
+      ok("audio_sources: the audio_url bytes", hexs(srcs[1].bytes) == "5249464624000000");
+      ok("audio_sources: no url set for the byte form", srcs[0].url.empty() && srcs[1].url.empty());
+      bool threw = false;
+      try {
+        ni::ChatRequest bad = q;
+        bad.messages = json::parse(R"([{"role": "user", "content": [
+          {"type": "input_audio", "input_audio": {"data": "UklGRiQAAAA=", "format": "mp3"}}]}])");
+        ni::vision::audio_sources(bad.messages);
+      } catch (const ni::vision::Error&) {
+        threw = true;
+      }
+      ok("audio_sources: a non-wav format is refused", threw);
+      threw = false;
+      try {
+        ni::ChatRequest bad = q;
+        bad.messages = json::parse(R"([{"role": "user", "content": [
+          {"type": "input_audio", "input_audio": {"format": "wav"}}]}])");
+        ni::vision::audio_sources(bad.messages);
+      } catch (const ni::vision::Error&) {
+        threw = true;
+      }
+      ok("audio_sources: a part without data is refused", threw);
     }
     ok("the model folder has config.json and model.safetensors",
        !read_json(dir + "/config.json").is_discarded() &&
