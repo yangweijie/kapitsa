@@ -1726,6 +1726,10 @@ int ni::server::run_service(Options o) {
       json msg{{"role", "assistant"}, {"content", out.content}};
       if (!out.reasoning.empty()) msg["reasoning_content"] = out.reasoning;
       if (!out.tool_calls.empty()) msg["tool_calls"] = api::chat_tool_calls(out.tool_calls, 0, false);
+      // the Omni's speech reply: the response's audio as a base64 WAV, OpenAI's message.audio shape
+      // (without the id/expires_at a stored asset would have)
+      if (!out.audio_wav.empty())
+        msg["audio"] = json{{"data", api::base64_encode(out.audio_wav)}, {"format", "wav"}, {"sample_rate", 24000}};
       json j{{"id", id},
              {"object", "chat.completion"},
              {"created", created},

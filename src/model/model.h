@@ -171,6 +171,8 @@ class Model {
   virtual std::vector<int> speech_frame(uint64_t seed) { return {}; }
   // The codebook code that ends the speech (the depth decoder's end-of-audio frame: all 12 equal it).
   virtual int audio_eos_code() const { return -1; }
+  // The generated frames' codes (one vector of 12 per frame) -> the 24 kHz waveform samples.
+  virtual std::vector<float> decode_speech(const std::vector<std::vector<int>>& frames) { return {}; }
   // The speech slots force the audio-out token instead of sampling text (the Omni's audio mode).
   virtual void set_speech_mode(bool on) {}
   virtual void encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingParams& sp, uint32_t step,

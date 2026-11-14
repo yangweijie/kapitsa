@@ -482,6 +482,20 @@ void Lfm3::load_tts() {
        audio_out_token_);
 }
 
+std::vector<float> Lfm3::decode_speech(const std::vector<std::vector<int>>& frames) {
+  if (frames.empty()) return {};
+  if (!codec_) codec_ = std::make_unique<tts::CodecDecoder>(path_ + "/codec-decoder.safetensors");
+  const int F = int(frames.size());
+  std::vector<int> codes;
+  codes.reserve(size_t(F) * 12);
+  for (int c = 0; c < 12; ++c)
+    for (int t = 0; t < F; ++t) codes.push_back(frames[size_t(t)][size_t(c)]);
+  std::vector<float> audio;
+  codec_->decode(codes, F, audio);
+  logi("tts: %d speech frames decoded to %.2f s of audio", F, double(audio.size()) / 24000.0);
+  return audio;
+}
+
 std::vector<int> Lfm3::speech_frame(uint64_t seed) {
   if (!tts_) load_tts();
   if (!tts_) return {};

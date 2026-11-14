@@ -4479,7 +4479,35 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   res.decode_ms = now_ms() - t1;
   if (!speech_frames.empty()) {
     res.audio_frames = std::move(speech_frames);
-    logi("tts: %d speech frames sampled", int(res.audio_frames.size()));
+    auto samples = model_->decode_speech(res.audio_frames);
+    if (!samples.empty()) {
+      std::string wav = "RIFF";
+      const int n = int(samples.size());
+      auto push = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) wav.push_back(char((v >> (8 * i)) & 0xFF));
+      };
+      auto push16 = [&](uint16_t v) {
+        wav.push_back(char(v & 0xFF));
+        wav.push_back(char((v >> 8) & 0xFF));
+      };
+      wav += "WAVEfmt ";
+      push(16);
+      push16(1);
+      push16(1);
+      push(24000);
+      push(48000);
+      push16(2);
+      push16(16);
+      wav += "data";
+      push(uint32_t(n * 2));
+      for (float v : samples) {
+        const float cl = std::clamp(v, -1.0f, 1.0f);
+        push16(uint16_t(int16_t(cl * 32767.0f)));
+      }
+      res.audio_wav = std::move(wav);
+      logi("tts: %d frames -> %.2f s of audio (%zu bytes wav)", int(res.audio_frames.size()),
+           double(n) / 24000.0, res.audio_wav.size());
+    }
   }
   if (trace_path) {  // one line: the prompt (FNV-1a of its ids), the first token, then each cycle's tokens and margins
     uint64_t h = 1469598103934665603ull;

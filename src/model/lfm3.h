@@ -9,6 +9,7 @@
 #pragma once
 #include "loader/safetensors.h"
 #include "vision/lfm3_tts.h"
+#include "vision/lfm3_codec.h"
 #include "model/model.h"
 
 #include <map>
@@ -127,6 +128,7 @@ class Lfm3 : public Model {
   int audio_out_token() const override { return audio_out_token_; }
   int audio_eos_code() const override;
   std::vector<int> speech_frame(uint64_t seed) override;
+  std::vector<float> decode_speech(const std::vector<std::vector<int>>& frames) override;
   // The speech slots force <|audio_out|> (the reference's audio mode masks the text head); the
   // engine samples each frame after the step completes (speech_frame) and ends on the eos frame.
   void set_speech_mode(bool on) override;
@@ -162,6 +164,7 @@ class Lfm3 : public Model {
   bool sample_sg_ = false;        // topk_stage1_rows_sg (an Apple10 GPU on macOS 26), as Qwen35 reads it
   // the speech side, loaded lazily on the first audio-out frame (the weights are the side file)
   std::unique_ptr<tts::DepthDecoder> tts_;
+  std::unique_ptr<tts::CodecDecoder> codec_;
   int audio_out_token_ = -1, audio_eos_code_ = -1;
   float audio_temperature_ = 0.0f;
   bool speech_forced_ = false;  // the speech slots force <|audio_out|> (the audio mode's mask)

@@ -614,6 +614,54 @@ def convert_gen_depth(hf_dir, out, verify):
         print(f"verify: {len(kept)} tensors re-read ok")
 
 
+CODEC_KEEP_PREFIXES = ("decoder.lfm.", "decoder.lin.", "decoder.istft.",
+                       "quantizer.fsq.project_out.", "from_quantizer.")
+
+
+def convert_codec_decoder(codec_dir, out, verify):
+    """The LiquidCodec DECODER-side tensors copied as-is (bf16) into
+    OUT/codec-decoder.safetensors — the speech path loads it to turn the frames' codes
+    into the 24 kHz waveform."""
+    import json as j
+    src = os.path.join(codec_dir, "model.safetensors")
+    with open(src, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = j.loads(f.read(n))
+        data_at = 8 + n
+    kept = {}
+    blobs = []
+    at = 0
+    for name in sorted(hdr):
+        if name == "__metadata__" or not name.startswith(CODEC_KEEP_PREFIXES):
+            continue
+        t = hdr[name]
+        begin, end = t["data_offsets"]
+        with open(src, "rb") as f:
+            f.seek(data_at + begin)
+            blobs.append((name, t["dtype"], t["shape"], f.read(end - begin)))
+    for name, dtype, shape, blob in blobs:
+        start = at
+        at += len(blob)
+        kept[name] = {"dtype": dtype, "shape": shape, "data_offsets": [start, at]}
+    head = j.dumps(kept, separators=(",", ":")).encode()
+    pad = (8 - (8 + len(head)) % 8) % 8
+    with open(os.path.join(out, "codec-decoder.safetensors"), "wb") as f:
+        f.write(struct.pack("<Q", len(head) + pad))
+        f.write(head)
+        f.write(b" " * pad)
+        for _, _, _, blob in blobs:
+            f.write(blob)
+    print(f"codec decoder: {len(kept)} tensors ({sum(len(b) for _, _, _, b in blobs)} bytes) -> "
+          f"{out}/codec-decoder.safetensors")
+    if verify:
+        with open(os.path.join(out, "codec-decoder.safetensors"), "rb") as f:
+            n2 = struct.unpack("<Q", f.read(8))[0]
+            h2 = j.loads(f.read(n2))
+            for name in kept:
+                assert name in h2 and h2[name]["data_offsets"] == kept[name]["data_offsets"], name
+        print(f"verify: {len(kept)} tensors re-read ok")
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -629,6 +677,8 @@ def main():
     p.add_argument("--self-test", action="store_true", help="check the decoder and the name map, no file needed")
     p.add_argument("--verify", action="store_true", help="re-read the output safetensors and check every tensor")
     p.add_argument("--audio", action="store_true", help="convert the audio input path (a.*, mm.a.*) instead of vision")
+    p.add_argument("--codec-from", metavar="CODEC_DIR",
+                   help="copy the LiquidCodec DECODER-side tensors into OUT as codec-decoder.safetensors")
     p.add_argument("--gen-depth", metavar="HF_DIR",
                    help="copy the audio GENERATION side (the depth decoder + codebook_embedding) from an HF "
                         "checkpoint dir into OUT as audio-gen.safetensors + audio_gen_config.json (the GGUF "
@@ -638,6 +688,9 @@ def main():
         self_test()
         if a.src is None:
             return 0
+    if a.codec_from:
+        convert_codec_decoder(a.codec_from, a.out if a.out else a.src, a.verify)
+        return 0
     if a.gen_depth:
         convert_gen_depth(a.gen_depth, a.out if a.out else a.src, a.verify)
         return 0
