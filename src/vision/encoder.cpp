@@ -167,37 +167,62 @@ static int image_key(const Digest& d, int j) {
 }
 
 Prompt expand(const std::vector<int>& ids, int placeholder, const std::vector<Prepared>& images, int* index,
-              const std::vector<int>& pre, const std::vector<int>& post) {
+              const std::vector<int>& pre, const std::vector<int>& post, int audio_placeholder,
+              const std::vector<Prepared>& audio) {
   Prompt pr;
-  size_t k = 0;
+  size_t k = 0, ka = 0;
   int shift = 0;
   const int wrap = int(pre.size() + post.size());
   size_t total = ids.size();
   for (const Prepared& p : images) total += size_t(std::max(0, p.tokens - 1 + wrap));
+  for (const Prepared& p : audio) total += size_t(std::max(0, p.tokens - 1));
   pr.ids.reserve(total);
   pr.keys.reserve(total);
+  const bool two = audio_placeholder >= 0 && !audio.empty();
   for (size_t i = 0; i < ids.size(); ++i) {
-    if (ids[i] != placeholder) {
+    const bool is_image = ids[i] == placeholder;
+    const bool is_audio = two && ids[i] == audio_placeholder;
+    if (!is_image && !is_audio) {
       pr.ids.push_back(ids[i]);
       pr.keys.push_back(ids[i]);
       continue;
     }
-    if (k >= images.size())
-      throw Error("the prompt has more image placeholders than images (an <|image_pad|> written in the text?)");
-    const Prepared& p = images[k++];
-    for (int t : pre) pr.ids.push_back(t), pr.keys.push_back(t);
-    pr.spans.push_back(ImageSpan{int(pr.ids.size()), p.tokens, p.grid_t, p.grid_h, p.grid_w});
-    pr.digests.push_back(p.digest);
-    for (int j = 0; j < p.tokens; ++j) {
-      pr.ids.push_back(placeholder);
-      pr.keys.push_back(image_key(p.digest, j));
+    if (is_image) {
+      if (k >= images.size())
+        throw Error("the prompt has more image placeholders than images (an <|image_pad|> written in the text?)");
+      const Prepared& p = images[k++];
+      for (int t : pre) pr.ids.push_back(t), pr.keys.push_back(t);
+      pr.spans.push_back(ImageSpan{int(pr.ids.size()), p.tokens, p.grid_t, p.grid_h, p.grid_w});
+      pr.kinds.push_back(Media::image);
+      pr.digests.push_back(p.digest);
+      for (int j = 0; j < p.tokens; ++j) {
+        pr.ids.push_back(placeholder);
+        pr.keys.push_back(image_key(p.digest, j));
+      }
+      for (int t : post) pr.ids.push_back(t), pr.keys.push_back(t);
+      if (index && int(i) < *index) shift += p.tokens - 1 + wrap;
+    } else {
+      if (ka >= audio.size())
+        throw Error("the prompt has more audio placeholders than audio clips");
+      const Prepared& p = audio[ka++];
+      // no pre/post: the template rendered its own <|vision_start|>/<|vision_end|> pair around the
+      // placeholder; the HF processor's expansion adds exactly one pair, and this is it
+      pr.spans.push_back(ImageSpan{int(pr.ids.size()), p.tokens, 1, p.tokens, 1});
+      pr.kinds.push_back(Media::audio);
+      pr.digests.push_back(p.digest);
+      for (int j = 0; j < p.tokens; ++j) {
+        pr.ids.push_back(audio_placeholder);
+        pr.keys.push_back(image_key(p.digest, j));
+      }
+      if (index && int(i) < *index) shift += p.tokens - 1;
     }
-    for (int t : post) pr.ids.push_back(t), pr.keys.push_back(t);
-    if (index && int(i) < *index) shift += p.tokens - 1 + wrap;
   }
   if (k != images.size())
     throw Error("the chat template rendered " + std::to_string(k) + " of the request's " + std::to_string(images.size()) +
                 " images (images are taken in user, assistant and tool messages, not in system messages)");
+  if (two && ka != audio.size())
+    throw Error("the chat template rendered " + std::to_string(ka) + " of the request's " + std::to_string(audio.size()) +
+                " audio clips (audio parts are taken in user, assistant and tool messages, not in system messages)");
   if (index && *index >= 0) *index += shift;
   return pr;
 }

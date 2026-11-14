@@ -43,6 +43,16 @@ struct Source {
 // The image parts of `messages` in the order a chat template renders them (messages in order, parts in order).
 // Throws Error for video parts and for image parts without a usable source.
 std::vector<Source> image_sources(const nlohmann::ordered_json& messages);
+// The audio parts of `messages`, likewise (the Omni template renders {"type": "audio"|"audio_url"|"input_audio"}
+// as its <|audio|> placeholder): OpenAI's input_audio {"data": <base64>, "format": ...} rides as bytes, an
+// audio_url's data:/http(s) URL as url. Throws Error for audio parts without a usable source.
+std::vector<Source> audio_sources(const nlohmann::ordered_json& messages);
+// `messages` with every audio part's data replaced by a short stand-in (the form the model's template renders as
+// its audio placeholder, {"type": "audio"} for LFM3-Omni): the template renders the same text without copying
+// megabytes of base64 around.
+nlohmann::ordered_json without_audio_data(const nlohmann::ordered_json& messages,
+                                          const nlohmann::ordered_json& part =
+                                              nlohmann::ordered_json{{"type", "audio"}});
 // `messages` with every image part's data replaced by a short stand-in: the template renders the same text without
 // copying megabytes of base64 around. The stand-in is `part`, the content-part form the model's chat template
 // renders as its image placeholder (ImageEncoder::image_part(): OpenAI's image_url for the Qwen family,

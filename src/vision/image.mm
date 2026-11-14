@@ -127,6 +127,45 @@ static std::string base64_decode(const char* p, size_t n) {
   return out;
 }
 
+std::vector<Source> audio_sources(const ojson& messages) {
+  std::vector<Source> out;
+  if (!messages.is_array()) return out;
+  for (const ojson& m : messages) {
+    if (!m.is_object() || !m.contains("content") || !m["content"].is_array()) continue;
+    for (const ojson& it : m["content"]) {
+      if (!it.is_object() || !it.contains("type")) continue;
+      const std::string ty = it.value("type", std::string());
+      if (ty != "input_audio" && ty != "audio" && ty != "audio_url") continue;
+      Source s;
+      const ojson src = ty == "input_audio" ? it.value("input_audio", ojson())
+                                            : it.contains("source") ? it["source"] : it.value("audio_url", ojson());
+      if (!src.is_object()) throw Error("an audio content part has no audio: expected {\"type\": \"input_audio\", "
+                                        "\"input_audio\": {\"data\": <base64 wav>, \"format\": \"wav\"}}");
+      const auto data = src.find("data");
+      if (data == src.end() || !data->is_string()) throw Error("an audio content part has no data");
+      const std::string b64 = data->get<std::string>();
+      if (b64.size() > 7 && b64.compare(0, 5, "data:") == 0) {
+        const size_t comma = b64.find(',');
+        if (comma != std::string::npos) s.bytes = base64_decode(b64.data() + comma + 1, b64.size() - comma - 1);
+      }
+      if (s.bytes.empty()) s.bytes = base64_decode(b64.data(), b64.size());
+      const auto fmt = src.find("format");
+      if (fmt != src.end() && fmt->is_string() && fmt->get<std::string>() != "wav")
+        throw Error("audio: only wav clips are supported (got " + fmt->get<std::string>() + ")");
+      const auto mt = src.find("media_type");
+      if (mt != src.end() && mt->is_string()) {
+        const std::string mts = mt->get<std::string>();
+        if (mts.find("wav") == std::string::npos) throw Error("audio: only audio/wav is supported (got " + mts + ")");
+      }
+      if (s.bytes.empty()) throw Error("an audio content part carries no bytes");
+      out.push_back(s);
+    }
+  }
+  return out;
+}
+
+
+
 static std::string percent_decode(const char* p, size_t n) {
   std::string out;
   out.reserve(n);

@@ -411,6 +411,7 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   // follows the span)
   audio_start_ = tok_.find("<|audio_start|>");
   audio_end_ = tok_.find("<|audio_end|>");
+  audio_placeholder_ = tok_.find("<|audio|>");  // the Omni's audio placeholder (the template's part form)
   if (nh_) {
     // Nemotron Nano 9B v2: its tokenizer has no <think> or tool-call tokens (the tags are text; its calls
     // <TOOLCALL>[{"name": ..., "arguments": ...}]</TOOLCALL>), and its template switches thinking with "/think" /
@@ -601,6 +602,13 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
       logi("images: %s, %.2f GB loaded on the first image", enc->describe().c_str(), enc->weight_bytes() / 1e9);
       vision_ = std::make_unique<vision::Vision>(std::move(enc));
     }
+  }
+  // the Omni's audio INPUT tower (CPU): the config's audio side, loaded on the first clip
+  audio::AudioConfig ac;
+  if (audio::Lfm3Audio::supports(opts_.model_dir, &ac)) {
+    audio_ = std::make_unique<audio::Lfm3Audio>(opts_.model_dir, ac);
+    logi("audio: the Omni's audio input tower, %.2f GB, loaded on the first clip",
+         audio_->weight_bytes() / 1e9);
   }
   // batched decode for DFlash2 drafters (Qwen3.6 35B-A3B, Qwen3.8 27B) and LiLiCorr on Bolt's 24 GB checkpoint; the
   // 4B's DFlash (v1) drafter, Super-VL's LiLiCorr and Lightning's DSpark take turns today, a narrower gate than the
@@ -2363,9 +2371,40 @@ static std::vector<vision::Prepared> request_images(vision::Vision* vis, std::ve
   return src->empty() ? std::vector<vision::Prepared>() : vis->prepare(*src);
 }
 
+// The request's audio clips, decoded to log-mel (the tower is CPU: the weights load on the first clip).
+// Throws Error on formats it cannot read.
+// The request's audio clips: the prompt-side Prepared (tokens + digest for the expansion) and the
+// tower's AudioPrepared (the log-mel the encode reads), in the same order.
+struct RequestedAudio {
+  std::vector<vision::Prepared> meta;
+  std::vector<audio::AudioPrepared> clips;
+};
+static RequestedAudio request_audio(audio::Lfm3Audio* a, const ojson& messages) {
+  RequestedAudio out;
+  if (!a) return out;
+  const auto srcs = vision::audio_sources(messages);
+  if (srcs.empty()) return out;
+  for (const vision::Source& s : srcs) {
+    const auto p = a->prepare(s.bytes);
+    vision::Prepared vp;
+    vp.tokens = p.tokens;
+    std::copy(std::begin(p.digest.b), std::end(p.digest.b), vp.digest.begin());
+    vp.kind = vision::Media::audio;  // audio clips carry tokens + digest only (the tower is CPU)
+    out.meta.push_back(vp);
+    out.clips.push_back(p);
+  }
+  return out;
+}
+
 vision::Prompt Engine::expand_images(const std::vector<int>& ids, const std::vector<vision::Prepared>& images,
                                      int* index) const {
   return vision::expand(ids, vision_->encoder().placeholder(), images, index, img_pre_, img_post_);
+}
+
+vision::Prompt Engine::expand_media(const std::vector<int>& ids, const std::vector<vision::Prepared>& images,
+                                    const std::vector<vision::Prepared>& audio, int* index) const {
+  return vision::expand(ids, vision_->encoder().placeholder(), images, index, img_pre_, img_post_,
+                        audio_placeholder_, audio);
 }
 
 int Engine::count_tokens(const ChatRequest& r_in) const {
@@ -2373,9 +2412,11 @@ int Engine::count_tokens(const ChatRequest& r_in) const {
   default_template_kwargs(r);
   std::vector<vision::Source> src;
   const std::vector<vision::Prepared> images = request_images(vision_.get(), &src, r.messages);
+  const RequestedAudio ra = request_audio(audio_.get(), r.messages);
+  const std::vector<vision::Prepared>& clips = ra.meta;
   const std::vector<int> ids = tok_.encode(render(r, true));
-  if (images.empty()) return int(ids.size());
-  return int(expand_images(ids, images).ids.size());  // the images' rows
+  if (images.empty() && clips.empty()) return int(ids.size());
+  return int(expand_media(ids, images, clips).ids.size());  // the media rows
 }
 
 int pick_new_conversation_slot(const std::vector<NewConversationSlot>& v, const std::string& key, bool* by_key) {
@@ -2527,6 +2568,17 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     return res;
   }
   const double img_prep_ms = now_ms() - t_img;
+  // audio: decoded to log-mel before the GPU turn too (the tower is CPU; the weights load on the first clip)
+  RequestedAudio ra;
+  try {
+    ra = request_audio(audio_.get(), r.messages);
+  } catch (const std::exception& ex) {
+    ChatResult res;
+    res.finish_reason = "error";
+    res.invalid_request = dynamic_cast<const vision::Error*>(&ex) != nullptr;
+    res.error = res.invalid_request ? ex.what() : std::string("audio: ") + ex.what();
+    return res;
+  }
   // the prompt: rendered and tokenized before the GPU turn too (CPU only: a request in flight decodes meanwhile)
   const double t_req = now_ms();
   ChatResult res;
@@ -2555,9 +2607,9 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   // images: each placeholder becomes the image's rows; prefix reuse compares keys that tell images apart by content
   vision::Prompt mm;
   const vision::Prompt* mmp = nullptr;
-  if (!images.empty()) {
+  if (!images.empty() || !ra.meta.empty()) {
     try {
-      mm = expand_images(prompt, images, &boundary);
+      mm = expand_media(prompt, images, ra.meta, &boundary);
     } catch (const vision::Error& ex) {
       res.finish_reason = "error";
       res.invalid_request = true;
@@ -2732,14 +2784,23 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   std::vector<vision::EmbedRun> runs;
   int img_encoded = 0, img_reused = 0;  // images encoded now, from the embeddings of earlier requests
   double img_ms = 0;
+  std::vector<Buffer> audio_rows;  // the audio clips' embeddings, alive until the prefill has consumed them
   auto image_runs = [&](int from) {
     const double t0 = now_ms();
+    size_t ka = 0;  // the audio clips' index among the spans
     for (size_t k = 0; k < mm.spans.size(); ++k) {
       const vision::ImageSpan& sp = mm.spans[k];
       if (sp.pos + sp.n <= from) continue;
       bool have = false;
       for (const vision::EmbedRun& run : runs) have = have || run.pos == sp.pos;
       if (have) continue;
+      const bool is_audio = k < mm.kinds.size() && mm.kinds[k] == vision::Media::audio;
+      if (is_audio) {
+        if (!audio_->loaded()) audio_->load();
+        audio_rows.push_back(audio_->encode(ra.clips[ka++]));
+        runs.push_back(vision::EmbedRun{sp.pos, sp.n, audio_rows.back(), 0, audio_->out_dim()});
+        continue;
+      }
       bool encoded = false;
       const Buffer emb =
           vision_->embeddings(images[k], img_src[k], [&](size_t b) { return make_room(slot, b); }, &encoded);

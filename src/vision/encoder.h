@@ -22,6 +22,11 @@
 
 namespace ni::vision {
 
+// The two media kinds an encoder feeds a prompt: images (Lfm3ViT, QwenViT, RadioViT) and audio
+// clips (the LFM3-Omni audio tower, ni::audio::Lfm3Audio). They share the prompt side: a
+// placeholder token per clip expanded to its rows, spans for prefix reuse, embeddings by digest.
+enum class Media : uint8_t { image, audio };
+
 // An image as its encoder takes it: the CPU part of the processor done, the GPU part (encode) to come.
 struct Prepared {
   int tokens = 0;                          // embedding rows the image takes in the prompt
@@ -31,6 +36,7 @@ struct Prepared {
   PixelBuffer pixels;                      // the encoder's input (QwenViT: resized RGB rows, RadioViT: half patch
                                            // rows); empty when only the metadata came from the cache
                                            // (Vision::embeddings prepares it again)
+  Media kind = Media::image;               // audio clips carry tokens + digest only (the tower is CPU)
 };
 
 class ImageEncoder {
@@ -130,18 +136,23 @@ class Vision {
 
 // ---- the prompt side ----
 
-// A prompt with its images in place: `ids` for the model (each placeholder expanded to its image's rows), `keys` for
-// prefix reuse (image rows get ids derived from the image's digest, ids no token has), the images' spans and digests.
+// A prompt with its media in place: `ids` for the model (each placeholder expanded to its rows), `keys` for
+// prefix reuse (media rows get ids derived from the clip's digest, ids no token has), the spans (images first,
+// then audio clips, in prompt order) and digests.
 struct Prompt {
   std::vector<int> ids, keys;
   std::vector<ImageSpan> spans;
+  std::vector<Media> kinds;  // per span: image or audio
   std::vector<Digest> digests;  // per span
 };
-// Expands each placeholder token of `ids` (in order) to its image's rows, between the tokens `pre` and `post` (the
-// processor's own marks around an image: ImageEncoder::image_start / image_end). `index` (e.g. a turn boundary) moves
-// with the expansion. Throws Error when the placeholders and the images do not pair up.
+// Expands each placeholder token of `ids` (in order) to its media's rows. Images get the tokens `pre` and
+// `post` around their rows (the processor's own marks: ImageEncoder::image_start / image_end); audio clips
+// get none (the Omni template renders its own <|vision_start|>/<|vision_end|> pair around <|audio|>, and the
+// HF processor adds exactly one pair). `index` (e.g. a turn boundary) moves with the expansion. Throws Error
+// when the placeholders and the media do not pair up.
 Prompt expand(const std::vector<int>& ids, int placeholder, const std::vector<Prepared>& images, int* index = nullptr,
-              const std::vector<int>& pre = {}, const std::vector<int>& post = {});
+              const std::vector<int>& pre = {}, const std::vector<int>& post = {}, int audio_placeholder = -1,
+              const std::vector<Prepared>& audio = {});
 // Rows two prompts share as a reusable prefix: equal keys, and every image in the prefix the same image (digest and
 // span) in both: a different image never reuses another image's state, however its rows' keys compare.
 size_t common_prefix(const std::vector<int>& a_keys, const std::vector<ImageSpan>& a_spans,

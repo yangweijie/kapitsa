@@ -11,6 +11,7 @@
 #include "model/dflash2.h"
 #include "model/dory.h"
 #include "model/flint.h"
+#include "vision/lfm3_audio.h"
 #include "model/kflash_budget.h"
 #include "model/kflash_wrap.h"
 #include "model/lilicorr.h"
@@ -19,6 +20,7 @@
 #include "model/qwen4_exp.h"
 #include "tokenizer/tokenizer.h"
 #include "vision/encoder.h"
+#include "vision/lfm3_audio.h"
 
 #include <nlohmann/json.hpp>
 
@@ -684,10 +686,16 @@ class Engine {
   std::unique_ptr<KfBudget> kf_budget_;
   Buffer kf_params_;  // KfParams the budget writes for the GPU tree builder
   std::unique_ptr<vision::Vision> vision_;  // the image encoder, for models that take images
+  std::unique_ptr<audio::Lfm3Audio> audio_;  // the LFM3-Omni audio tower (CPU v1), for models that take audio input
+  int audio_placeholder_ = -1;               // the <|audio|> token (audio_'s placeholder, when the tokenizer has it)
   std::vector<int> img_pre_, img_post_;     // the tokens its processor puts around an image's rows (Nemotron: <img>)
   // `ids` with each image placeholder expanded to its image's rows (vision::expand with the encoder's marks)
   vision::Prompt expand_images(const std::vector<int>& ids, const std::vector<vision::Prepared>& images,
                                int* index = nullptr) const;
+  // The same, with the audio clips' <|audio|> placeholders expanded too (no marks around them: the Omni template
+  // renders its own <|vision_start|>/<|vision_end|> pair)
+  vision::Prompt expand_media(const std::vector<int>& ids, const std::vector<vision::Prepared>& images,
+                              const std::vector<vision::Prepared>& audio, int* index = nullptr) const;
   Tokenizer tok_;
   std::unique_ptr<minja::chat_template> tmpl_;
   std::vector<Slot> slots_;
