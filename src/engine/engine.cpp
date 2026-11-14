@@ -399,7 +399,20 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   std::string src = chat_template_source(opts_.model_dir);
   if (src.empty()) fatal("no chat template in %s", opts_.model_dir.c_str());
   if (flint_) src = flint_template(src);
-  tmpl_ = std::make_unique<minja::chat_template>(src, flint_ ? "<|begin_of_text|>" : "",
+  // The template's {{ bos_token }} (LFM3's <|startoftext|>, the token the checkpoints start every
+  // context with): tokenizer_config.json's bos_token, which kapitsa import writes from the GGUF.
+  // An empty one made the Omni render without its start token — the first predicted token shifted
+  // (every Chinese chat fell into the `: 1. 你说:` attractor where the reference answers cleanly).
+  std::string bos;
+  {
+    nlohmann::json tc = nlohmann::json::parse(read_file(opts_.model_dir + "/tokenizer_config.json"), nullptr, false);
+    if (tc.is_object() && tc.contains("bos_token")) {
+      const nlohmann::json& bt = tc.at("bos_token");
+      if (bt.is_string()) bos = bt.get<std::string>();
+      else if (bt.is_object()) bos = bt.value("content", "");
+    }
+  }
+  tmpl_ = std::make_unique<minja::chat_template>(src, flint_ ? "<|begin_of_text|>" : bos,
                                                  flint_ ? "<|end_of_text|>" : "<|im_end|>");
   preserve_thinking_default_ = !flint_ && !nh_ && !dory_ && preserve_thinking_template(src);
   think_open_ = tok_.find("<think>");
@@ -2601,6 +2614,12 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   int boundary = -1;
   const bool prefix_ok = text.compare(0, base.size(), base) == 0;
   std::vector<int> prompt = tok_.encode(text, prefix_ok ? base.size() : std::string::npos, &boundary);
+  if (getenv("NI_CHAT_DEBUG")) {  // the rendered prompt and its ids, for context-vs-reference diffs
+    fprintf(stderr, "[chat-debug] rendered: %s\n", text.c_str());
+    fprintf(stderr, "[chat-debug] ids (%zu):", prompt.size());
+    for (int i : prompt) fprintf(stderr, " %d", i);
+    fprintf(stderr, "\n");
+  }
   if (boundary < 0 && prefix_ok) {
     std::vector<int> bt = tok_.encode(base);
     if (bt.size() < prompt.size() && std::equal(bt.begin(), bt.end(), prompt.begin())) boundary = int(bt.size());
