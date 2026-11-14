@@ -19,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -476,6 +477,33 @@ int main() {
         threw = true;
       }
       ok("audio_sources: a part without data is refused", threw);
+    }
+    // the audio placeholder's expansion (the A3 prompt side): each <|audio|> becomes its clip's
+    // rows with NO marks around them (the Omni template renders its own pair), the spans carry the
+    // 1 x tokens x 1 grid and Media::audio, and the turn boundary moves with the clips before it
+    {
+      ni::vision::Prepared c1, c2;
+      c1.tokens = 25;
+      c2.tokens = 12;
+      c1.kind = c2.kind = ni::vision::Media::audio;
+      c1.digest[0] = 1;
+      c2.digest[0] = 2;
+      const int img_ph = 900, aud_ph = 901;
+      const std::vector<int> ids = {100, 101, aud_ph, 102, aud_ph, 103};
+      int index = 4;  // a turn boundary before the second clip
+      const ni::vision::Prompt pr =
+          ni::vision::expand(ids, img_ph, {}, &index, {}, {}, aud_ph, {c1, c2});
+      ok("the audio expansion: rows, spans, kinds, digests and the boundary",
+         pr.ids.size() == size_t(6 - 2 + 25 + 12) &&
+             std::count(pr.ids.begin(), pr.ids.end(), aud_ph) == 25 + 12 &&
+             index == 28 && pr.spans.size() == 2 && pr.spans[0].pos == 2 && pr.spans[0].n == 25 &&
+             pr.spans[0].grid_t == 1 && pr.spans[0].grid_h == 25 && pr.spans[0].grid_w == 1 &&
+             pr.spans[1].pos == 28 && pr.spans[1].n == 12 && pr.spans[1].grid_h == 12 &&
+             pr.kinds.size() == 2 && pr.kinds[0] == ni::vision::Media::audio &&
+             pr.kinds[1] == ni::vision::Media::audio && pr.digests[0][0] == 1 && pr.digests[1][0] == 2);
+      // the keys differ per row and per clip (the prefix-reuse form)
+      ok("the audio expansion: the rows' keys come from the clip's digest",
+         pr.keys[2] != pr.keys[3] && pr.keys[2] != pr.keys[2 + 25] && pr.keys[2] != 100);
     }
     ok("the model folder has config.json and model.safetensors",
        !read_json(dir + "/config.json").is_discarded() &&
