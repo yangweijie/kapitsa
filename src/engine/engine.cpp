@@ -2217,7 +2217,7 @@ std::string Engine::render(const ChatRequest& r, bool add_generation_prompt) con
   // Nemotron Nano 9B v2's template: the request's enable_thinking (every API's switch) as its "/think" / "/no_think"
   if (think_flags_ && r.template_kwargs.contains("enable_thinking"))
     return render_chat(*tmpl_, think_flag_request(r), add_generation_prompt, images, false,
-                        vision_->encoder().image_part());
+                        vision_ ? vision_->encoder().image_part() : ojson());
   if (nh_ || dory_) {
     // Nemotron 3.5's (and Dory's) template names two switches its own way: medium_effort (shorter reasoning) for the low and medium
     // reasoning efforts, and truncate_history_thinking = false for preserve_thinking (every turn's reasoning kept, as
@@ -2231,10 +2231,12 @@ std::string Engine::render(const ChatRequest& r, bool add_generation_prompt) con
       ChatRequest q = r;
       if (effort) q.template_kwargs["medium_effort"] = true;
       if (keep) q.template_kwargs["truncate_history_thinking"] = false;
-      return render_chat(*tmpl_, q, add_generation_prompt, images, flint_ != nullptr, vision_->encoder().image_part());
+      return render_chat(*tmpl_, q, add_generation_prompt, images, flint_ != nullptr,
+                         vision_ ? vision_->encoder().image_part() : ojson());
     }
   }
-  return render_chat(*tmpl_, r, add_generation_prompt, images, flint_ != nullptr, vision_->encoder().image_part());
+  return render_chat(*tmpl_, r, add_generation_prompt, images, flint_ != nullptr,
+                     vision_ ? vision_->encoder().image_part() : ojson());
 }
 
 // Flint's chat template is written for Jinja2, and minja (third_party, not edited) differs from it in three places the
