@@ -283,7 +283,7 @@ void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector
             const float* ks = k.data() + size_t(s) * (hkv * hd) + size_t(kvh) * hd;
             double acc = 0;
             for (int d = 0; d < hd; ++d) acc += double(qh[d]) * double(ks[d]);
-            sc[size_t(s - beg)] = acc / float(hd);
+            sc[size_t(s - beg)] = acc / std::sqrt(float(hd));  // the scale = head_dim^-0.5
             mx = std::max(mx, sc[size_t(s - beg)]);
           }
           double den = 0;
