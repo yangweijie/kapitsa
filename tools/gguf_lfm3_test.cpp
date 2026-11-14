@@ -407,6 +407,29 @@ int main() {
                                         nlohmann::ordered_json{{"type", "image_url"},
                                                                {"image_url", {{"url", "image"}}}});
       ok("the no-vision render is image_part-independent", p1 == p2);
+      // the agent-shaped request that crashed serve before the fix: images in EARLY and LATE user
+      // turns with a system message after the first (its marker-tool-response machinery runs too)
+      {
+        ni::ChatRequest qa;
+        qa.messages = json::parse(
+            R"([{"role": "user", "content": [{"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}]},
+               {"role": "system", "content": "be terse"},
+               {"role": "assistant", "content": "ok"},
+               {"role": "user", "content": [{"type": "text", "text": "more"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,y"}}]}])");
+        const std::string pa = ni::render_chat(tmpl, qa, true, false, false, nlohmann::ordered_json());
+        const auto notes = [](const std::string& t) {
+          size_t n = 0, at = 0;
+          while ((at = t.find("[image omitted: this model can't read images]", at)) != std::string::npos)
+            ++n, at += 43;
+          return n;
+        };
+        ok("the agent-shaped no-vision render notes both images and keeps the late system turn",
+           notes(pa) == 2 && pa.find("describe") != std::string::npos &&
+               pa.find("more") != std::string::npos && pa.find("be terse") != std::string::npos &&
+               pa.find("assistant") != std::string::npos);
+      }
     }
     ok("the model folder has config.json and model.safetensors",
        !read_json(dir + "/config.json").is_discarded() &&
