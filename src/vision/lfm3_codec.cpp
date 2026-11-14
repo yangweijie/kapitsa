@@ -47,10 +47,15 @@ std::vector<float> read_tensor(std::ifstream& f, const std::string& needle, long
   f.seekg(data_at + begin);
   f.read(reinterpret_cast<char*>(raw.data()), bytes);
   std::vector<float> out(n);
-  if (dtype == "BF16")
+  if (dtype == "BF16") {
     for (size_t i = 0; i < n; ++i) out[i] = bf16_to_f32(raw[i]);
-  else
-    for (size_t i = 0; i < n; ++i) __builtin_memcpy(&out[i], raw.data() + i, 4);
+  } else {
+    // F32: read straight into the float buffer (the uint16 staging's 2-byte stride would
+    // misread the 4-byte values — the istft window's NaNs were exactly this)
+    f.clear();
+    f.seekg(data_at + begin);
+    f.read(reinterpret_cast<char*>(out.data()), bytes);
+  }
   return out;
 }
 
@@ -157,8 +162,9 @@ void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector
   const int T = F * kFrameStack;
   std::vector<float> x(size_t(T) * kHidden);
   for (int j = 0; j < T; ++j) {
-    // nearest-exact: src = floor((dst + 0.5) / scale - 0.5), clamped to [0, F)
-    int src = int(std::floor((double(j) + 0.5) / double(kFrameStack) - 0.5));
+    // nearest-exact: src = floor((dst + 0.5) / scale) — WITHOUT the half-pixel offset (the torch's
+    // nearest-exact keeps the source's pixel centers unshifted); clamped to [0, F)
+    int src = int(std::floor((double(j) + 0.5) / double(kFrameStack)));
     src = std::clamp(src, 0, F - 1);
     memcpy(x.data() + size_t(j) * kHidden, emb.data() + size_t(src) * kHidden, size_t(kHidden) * 4);
   }
@@ -264,7 +270,7 @@ void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector
         for (int h = 0; h < hq; ++h) gate_t[h] = 1.0f / (1.0f + std::exp(-gate_t[h]));
       }
       // the causal attention with the sliding window 30
-      const int win = 30;
+      const int win = 31;
       for (int t = 0; t < T; ++t) {
         const int beg = std::max(0, t - win + 1);
         for (int h = 0; h < hq; ++h) {
@@ -304,6 +310,11 @@ void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector
       }
     }
     // the FFN half with its sandwich post-norm
+    if (dbg && l == 0) {
+      fprintf(stderr, "cpp attn-half x[0][:4]:");
+      for (int j = 0; j < 4; ++j) fprintf(stderr, " %.6f", x[j]);
+      fprintf(stderr, "\n");
+    }
     for (int t = 0; t < T; ++t)
       rms_norm(xn.data() + size_t(t) * kHidden, x.data() + size_t(t) * kHidden, L.ffn_norm.data(), kHidden, eps);
     for (int t = 0; t < T; ++t) {
@@ -313,21 +324,47 @@ void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector
       matvec(tmp.data() + size_t(t) * kHidden, gi.data() + size_t(t) * kFfn, L.w2.data(), kHidden, kFfn);
       rms_norm(o.data() + size_t(t) * kHidden, tmp.data() + size_t(t) * kHidden, L.post_ffn_norm.data(),
                kHidden, eps);
+      if (dbg && l == 0 && t == 0) {
+        fprintf(stderr, "cpp ffn-norm-in [0][:4]:");
+        for (int j = 0; j < 4; ++j) fprintf(stderr, " %.6f", x[size_t(t) * kHidden + j]);
+        fprintf(stderr, "\ncpp ffn-norm-out [0][:4]:");
+        for (int j = 0; j < 4; ++j) fprintf(stderr, " %.6f", xn[size_t(t) * kHidden + j]);
+        fprintf(stderr, "\ncpp ffn-out [0][:4]:");
+        for (int j = 0; j < 4; ++j) fprintf(stderr, " %.6f", tmp[size_t(t) * kHidden + j]);
+        fprintf(stderr, "\ncpp ffn-post [0][:4]:");
+        for (int j = 0; j < 4; ++j) fprintf(stderr, " %.6f", o[size_t(t) * kHidden + j]);
+        fprintf(stderr, "\n");
+      }
       for (int j = 0; j < kHidden; ++j) x[size_t(t) * kHidden + j] += o[size_t(t) * kHidden + j];
     }
-  }
-  if (dbg) {
-    fprintf(stderr, "stages interp[0][:4]:");
-    for (int j = 0; j < 4; ++j) fprintf(stderr, " %.6f", x[j]);
-    fprintf(stderr, "\n");
+    if (dbg) {
+      float mx = 0;
+      for (float v : x) mx = std::max(mx, std::fabs(v));
+      fprintf(stderr, "stages full%d [0][:4]:", l);
+      for (int j = 0; j < 4; ++j) fprintf(stderr, " %.6f", x[j]);
+      fprintf(stderr, " | max|x| over all t: %.3f\n", mx);
+      for (int p : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}) {
+        fprintf(stderr, "stages full%d [p%d]:", l, p);
+        for (int j = 0; j < 4; ++j) fprintf(stderr, " %.6f", x[size_t(p) * kHidden + j]);
+        fprintf(stderr, "\n");
+      }
+    }
   }
   // 5. the final norm, the STFT head, the iSTFT with the envelope and the trim
   for (int t = 0; t < T; ++t)
     rms_norm(tmp.data() + size_t(t) * kHidden, x.data() + size_t(t) * kHidden, final_norm_.data(), kHidden, eps);
   if (dbg) {
-    fprintf(stderr, "stages final[0][:4]:");
+    fprintf(stderr, "stages final [0][:4]:");
     for (int j = 0; j < 4; ++j) fprintf(stderr, " %.6f", tmp[j]);
-    fprintf(stderr, "\n");
+  }
+  if (dbg) {
+    size_t bad = 0;
+    for (float v : x) bad += std::isnan(v) || std::isinf(v);
+    fprintf(stderr, "codec: the trunk's x: NaN/inf %zu of %zu\n", bad, x.size());
+    size_t bads = 0, firsts = 0;
+    for (size_t i = 0; i < x.size(); ++i)
+      if ((std::isnan(x[i]) || std::isinf(x[i])) && !bads++) firsts = i;
+    if (bads) fprintf(stderr, "codec: the first bad x at %zu (the frame %d)\n", firsts, int(firsts / kHidden));
   }
   const int bins = kFft / 2 + 1;
   // spec[t][bin] = lin(tmp[t]) -> log_magnitude (bins 0..640), angle (bins 641..1281)
@@ -335,6 +372,22 @@ void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector
   for (int t = 0; t < T; ++t) {
     matvec(spec.data() + size_t(t) * bins * 2, tmp.data() + size_t(t) * kHidden, lin_w_.data(), bins * 2, kHidden);
     for (int j = 0; j < bins * 2; ++j) spec[size_t(t) * bins * 2 + j] += lin_b_[size_t(j)];
+  }
+  if (dbg) {
+    size_t bad = 0;
+    float lmx = -1e30f, lmn = 1e30f;
+    for (size_t i = 0; i < spec.size(); ++i) {
+      if (std::isnan(spec[i]) || std::isinf(spec[i])) ++bad;
+      if (i % (bins * 2) < bins) {  // the log-magnitude half
+        lmx = std::max(lmx, spec[i]);
+        lmn = std::min(lmn, spec[i]);
+      }
+    }
+    fprintf(stderr, "codec: the spec: NaN/inf %zu of %zu, the log-mag range [%.3f, %.3f]\n", bad, spec.size(),
+            lmn, lmx);
+    fprintf(stderr, "stages lin-out [0][:6]:");
+    for (int j = 0; j < 6; ++j) fprintf(stderr, " %.6f", spec[j]);
+    fprintf(stderr, "\n");
   }
   // the direct overlap-add synthesis: audio[s] += w[offset] * Re(spec_f * e^{2 pi i f s' / 1280})
   const long out_n = (long(T) - 1) * kHop + kWin;
@@ -345,15 +398,23 @@ void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector
     const float* ang = lm + bins;
     for (int d = 0; d < kWin; ++d) {
       const long s = base + d;
-      const double ph = 2.0 * M_PI * double(s % kFft) / double(kFft);
-      double re = 0;
-      for (int b = 0; b < bins; ++b) {
+      // the frame's phase runs on the LOCAL sample d (0..1279), not the global s — the global
+      // phase would add a 2*pi*b*hop/N rotation per frame, which the overlap-add must not have
+      const double ph = 2.0 * M_PI * double(d) / double(kFft);
+      // the irfft's synthesis (norm backward): x[s] = (X_0 + 2*sum_{b=1..639} Re(X_b e^{i...})
+      //     + X_640 cos(pi s)) / 1280 — the DC and the Nyquist counted once, the pairs doubled
+      double re = std::exp(double(lm[0])) * std::cos(double(ang[0]));
+      for (int b = 1; b < kFft / 2; ++b) {
         const double mag = std::exp(double(lm[b]));
         const double th = double(ang[b]) + ph * double(b);
-        re += mag * std::cos(th);
+        re += 2.0 * mag * std::cos(th);
       }
-      acc[size_t(s)] += double(window_[size_t(d)]) * re;
+      re += std::exp(double(lm[kFft / 2])) * std::cos(double(ang[kFft / 2]) + M_PI * double(s % 2));
+      acc[size_t(s)] += double(window_[size_t(d)]) * re / double(kFft);
       env[size_t(s)] += double(window_[size_t(d)]) * double(window_[size_t(d)]);
+      if (dbg && s == 1277)
+        fprintf(stderr, "codec: s=1277 t=%d d=%d re=%.9g window=%.9g acc=%.9g env=%.9g\n", t, d, re,
+                double(window_[size_t(d)]), acc[size_t(s)], env[size_t(s)]);
     }
   }
   audio.assign(size_t(out_n), 0.f);

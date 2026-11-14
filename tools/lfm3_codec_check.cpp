@@ -52,15 +52,32 @@ int main(int argc, char** argv) {
      "got " + std::to_string(got.size()) + " want " + std::to_string(golden.size()));
   if (got.size() == golden.size()) {
     double sig = 0, err = 0, maxd = 0;
+    size_t nan_count = 0, inf_count = 0, first_bad = 0;
     for (size_t i = 0; i < golden.size(); ++i) {
+      if (std::isnan(got[i]) || std::isinf(got[i])) {
+        if (!nan_count && !inf_count) first_bad = i;
+        ++(std::isnan(got[i]) ? nan_count : inf_count);
+      }
       sig += double(golden[i]) * double(golden[i]);
       const double d = double(got[i]) - double(golden[i]);
       err += d * d;
       maxd = std::max(maxd, std::fabs(d));
     }
+    if (nan_count || inf_count) {
+      printf("the bad samples: NaN %zu, inf %zu, the first at %ld (the golden there %.6f)\n", nan_count,
+             inf_count, long(first_bad), double(golden[first_bad]));
+      printf("the got around the first bad:");
+      for (long i = long(first_bad) - 3; i <= long(first_bad) + 3; ++i)
+        printf(" %.6g", double(got[size_t(i)]));
+      printf("\n");
+    }
     const double snr = 10.0 * std::log10(sig / std::max(err, 1e-30));
     ok("the codec decoder: the waveform SNR against the reference's decode", snr > 20.0,
        "SNR " + std::to_string(snr) + " dB, max |diff| " + std::to_string(maxd));
+  }
+  {
+    std::ofstream wf(std::string(golden_dir) + "/got.f32", std::ios::binary);
+    wf.write(reinterpret_cast<const char*>(got.data()), long(got.size() * 4));
   }
   printf("PASS (%d ok, %d failed)\n", passed, failed);
   return failed ? 1 : 0;

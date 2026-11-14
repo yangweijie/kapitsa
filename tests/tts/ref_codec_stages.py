@@ -28,7 +28,8 @@ codes_list = [v for row in meta["codes"] for v in row]
 codes = torch.tensor([codes_list], dtype=torch.long).reshape(1, 12, -1)
 print("codes:", tuple(codes.shape), flush=True)
 
-codec = transformers.AutoModel.from_pretrained(codec_dir, trust_remote_code=True, torch_dtype=torch.float32)
+codec = transformers.AutoModel.from_pretrained(codec_dir, trust_remote_code=True, torch_dtype=torch.float32,
+                                               attn_implementation="eager")
 codec.eval()
 for mod in (codec.encoder.lfm, codec.decoder.lfm):
     lt = getattr(mod.config, "layer_types", None)
@@ -49,16 +50,25 @@ with torch.no_grad():
     def snap(k):
         def hook(m, inp, o):
             t = o[0] if isinstance(o, tuple) else o
-            stages[k] = t[0, 0, :4].tolist()
+            stages[k] = {"p%d" % p: t[0, p, :4].tolist() for p in list(range(13)) + [100, 300, 575]}
         return hook
     for i, layer in enumerate(dec.lfm.layers):
-        layer.register_forward_hook(snap(f"layer{i}"))
+        layer.register_forward_hook(snap(f"py-layer{i}"))
     # the conv layer 0's internals, computed by hand (the C++ comparison)
     L0 = dec.lfm.layers[0]
     def pre_probe(m, inp):
         stages["layer0_input"] = inp[0][0, 0, :4].tolist()
         stages["layer0_input_shape"] = list(inp[0].shape)
     L0.register_forward_pre_hook(pre_probe)
+    def ffn_probe(m, inp, o):
+        stages["ffn0_out"] = o[0, 0, :4].tolist()
+    L0.feed_forward.register_forward_hook(ffn_probe)
+    def postffn_probe(m, inp, o):
+        stages["ffn0_post"] = o[0, 0, :4].tolist()
+    L0.post_ffn_norm.register_forward_hook(postffn_probe)
+    def ffnnorm_probe(m, inp, o):
+        stages["ffn0_norm"] = o[0, 0, :4].tolist()
+    L0.ffn_norm.register_forward_hook(ffnnorm_probe)
     with torch.no_grad():
         z1 = L0.operator_norm(up)
         stages["norm0"] = z1[0, 0, :4].tolist()
