@@ -504,6 +504,20 @@ int main() {
       // the keys differ per row and per clip (the prefix-reuse form)
       ok("the audio expansion: the rows' keys come from the clip's digest",
          pr.keys[2] != pr.keys[3] && pr.keys[2] != pr.keys[2 + 25] && pr.keys[2] != 100);
+      // the prefix-reuse contract: the same clip reuses through the clip's rows; a DIFFERENT clip
+      // in the same position stops the prefix before its rows (wrong reuse = silently wrong state)
+      {
+        ni::vision::Prepared c3;
+        c3.tokens = 25;
+        c3.kind = ni::vision::Media::audio;
+        c3.digest[0] = 9;  // a different clip, the same token count and position
+        const ni::vision::Prompt same = ni::vision::expand(ids, img_ph, {}, nullptr, {}, {}, aud_ph, {c1, c2});
+        const ni::vision::Prompt diff = ni::vision::expand(ids, img_ph, {}, nullptr, {}, {}, aud_ph, {c3, c2});
+        const size_t full = ni::vision::common_prefix(pr.keys, pr.spans, pr.digests, same);
+        const size_t stop = ni::vision::common_prefix(pr.keys, pr.spans, pr.digests, diff);
+        ok("the audio prefix reuse: the same clip reuses through its rows, a different one stops",
+           full == pr.keys.size() && stop == size_t(pr.spans[0].pos));
+      }
     }
     ok("the model folder has config.json and model.safetensors",
        !read_json(dir + "/config.json").is_discarded() &&
