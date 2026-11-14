@@ -362,6 +362,16 @@ int main() {
     const json tc = read_json(dir + "/tokenizer_config.json");
     ok("tokenizer_config.json: the GGUF's chat template",
        tc.contains("chat_template") && !tc["chat_template"].get<std::string>().empty());
+    // the chat template's {{ bos_token }} renders from tokenizer_config.json's bos_token: the
+    // import must write the GGUF bos/eos ids' VOCAB STRINGS (a number or a null here would render
+    // an empty start token and shift every chat chain — the Omni's `: 1. 你说:` attractor). The
+    // synthetic vocab ends <|im_start|>, <|im_end|>, ... at ids vocab-6, vocab-5.
+    ok("tokenizer_config.json: bos_token is the GGUF bos id's vocab string",
+       tc.contains("bos_token") && tc["bos_token"].is_string() &&
+           tc["bos_token"].get<std::string>() == "<|im_start|>");
+    ok("tokenizer_config.json: eos_token is the GGUF eos id's vocab string",
+       tc.contains("eos_token") && tc["eos_token"].is_string() &&
+           tc["eos_token"].get<std::string>() == "<|im_end|>");
     ok("the model folder has config.json and model.safetensors",
        !read_json(dir + "/config.json").is_discarded() &&
            std::ifstream(dir + "/model.safetensors").good());
