@@ -300,6 +300,32 @@ namespace {
 struct Dims { uint32_t x, y; };
 }  // namespace
 
+// HF's RepetitionPenaltyLogitsProcessor, on the all-masked frame logits: for each codebook and each
+// distinct code it recently emitted, divide the logit by the penalty (penalty > 1, positive only)
+// or multiply it (penalty < 1, negative only). Deduplicated per codebook so a code in several of the
+// window's frames is penalized once. A penalty of exactly 1.0 is a no-op (the reference's default).
+void DepthDecoder::apply_repetition_penalty(std::vector<float>& logits,
+                                            const std::vector<std::vector<int>>& codebook_history,
+                                            float penalty) {
+  if (penalty == 1.0f) return;
+  for (int c = 0; c < kCodebooks; ++c) {
+    if (c >= int(codebook_history.size())) break;
+    const auto& hist = codebook_history[size_t(c)];
+    std::vector<int> seen(kCodebookSize, 0);  // dedup within this codebook's window
+    for (int k : hist) {
+      if (k < 0 || k >= kCodebookSize) continue;
+      if (seen[size_t(k)]) continue;
+      seen[size_t(k)] = 1;
+      float& lg = logits[size_t(c) * kCodebookSize + size_t(k)];
+      if (penalty > 1.0f) {
+        if (lg > 0.0f) lg /= penalty;
+      } else if (penalty < 1.0f) {
+        if (lg < 0.0f) lg *= penalty;
+      }
+    }
+  }
+}
+
 // ---- the GPU path (src/kernels/tts.metal; the CPU forward above is the oracle) ----
 
 // The fp32 host copy as bf16 into a device buffer (the checkpoint's weights are bf16; the load

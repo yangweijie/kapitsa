@@ -48,6 +48,16 @@ class DepthDecoder {
   std::vector<int> sample_frame_gpu(const std::vector<float>& hidden, float temperature,
                                     const std::vector<int>& order);
 
+  // The audio repetition penalty (the reference's n_penalty on the codes each codebook emitted in
+  // the last n_window frames), HF's RepetitionPenaltyLogitsProcessor form: for each codebook c and
+  // each distinct code k in codebook_history[c], divide logits[c][k] by penalty (penalty > 1,
+  // positive logits only) or multiply it (penalty < 1, negative logits only). Applied to the
+  // all-masked logits before the MaskGIT argmax, so a code the codebook just emitted is down-weighted.
+  // codebook_history: kCodebooks x (the codebook's recent codes, up to n_window — deduplicated here).
+  static void apply_repetition_penalty(std::vector<float>& logits,
+                                       const std::vector<std::vector<int>>& codebook_history,
+                                       float penalty);
+
  private:
   struct Layer {
     std::vector<float> q_w, k_w, v_w, o_w, gate_w, w1, w2, w3, qn, kn, op_norm, ffn_norm;

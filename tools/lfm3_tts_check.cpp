@@ -130,6 +130,32 @@ int main(int argc, char** argv) {
     ok("the depth decoder's GPU path: the codes match the CPU oracle (argmax), deterministic",
        same >= 10 && gpu == gpu2);
   }
+  {
+    // the audio repetition penalty (the reference's n_penalty on the codes each codebook emitted in
+    // the last n_window frames; HF's RepetitionPenaltyLogitsProcessor form): down-weight a repeated
+    // code. penalty > 1 divides the POSITIVE logits; penalty < 1 multiplies the NEGATIVE ones; a
+    // code in several window frames is penalized once (dedup); 1.0 is a no-op.
+    const int CB = ni::tts::DepthDecoder::kCodebooks, CS = ni::tts::DepthDecoder::kCodebookSize;
+    auto run = [&](float penalty, const std::vector<int>& h0, float in5, float in7,
+                   float& o5, float& o7) {
+      std::vector<float> lg(size_t(CB) * CS, 1.0f);
+      lg[size_t(5)] = in5;  // codebook 0, code 5 (flat: c*CS + k, c=0)
+      lg[size_t(7)] = in7;  // codebook 0, code 7
+      const std::vector<std::vector<int>> hist = {{h0}, {}};
+      ni::tts::DepthDecoder::apply_repetition_penalty(lg, hist, penalty);
+      o5 = lg[size_t(5)];
+      o7 = lg[size_t(7)];
+    };
+    float o5, o7;
+    run(1.5f, {5, 5, 7}, 10.0f, -4.0f, o5, o7);  // penalty>1: divide the positive code, leave the negative
+    const bool div_ok = std::abs(o5 - 10.0f / 1.5f) < 1e-4 && std::abs(o7 - (-4.0f)) < 1e-4;
+    run(0.5f, {5, 7}, 10.0f, -4.0f, o5, o7);  // penalty<1: multiply the negative code, leave the positive
+    const bool mul_ok = std::abs(o5 - 10.0f) < 1e-4 && std::abs(o7 - (-4.0f * 0.5f)) < 1e-4;
+    run(1.0f, {5, 7}, 10.0f, -4.0f, o5, o7);  // penalty == 1.0: a no-op
+    const bool noop_ok = o5 == 10.0f && o7 == -4.0f;
+    ok("the audio repetition penalty: repeated codes down-weighted (HF form, dedup), 1.0 a no-op",
+       div_ok && mul_ok && noop_ok, "div " + std::to_string(o5) + " / mul " + std::to_string(o7));
+  }
   printf("PASS (%d ok, %d failed)\n", passed, failed);
   return failed ? 1 : 0;
 }
