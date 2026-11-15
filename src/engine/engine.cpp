@@ -3482,11 +3482,14 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       const bool end_of_audio = std::all_of(frame.begin(), frame.end(),
                                             [eos = model_->audio_eos_code()](int v) { return v == eos; });
       speech_frames.push_back(std::move(frame));
+      // the audio_out token drops from the text reply; the length cap counts it like any token
+      // (without this the speech loop never stops when the model emits no eos frame)
+      if (finish.empty() && gen >= r.max_tokens) finish = "length";
       if (end_of_audio) {  // the depth decoder's end-of-audio frame ends the speech
         finish = "stop";
         return false;
       }
-      return finish.empty();  // the audio_out token drops from the text reply
+      return finish.empty();
     }
     if (gm) {
       if (g_on) {
