@@ -242,17 +242,20 @@ void DepthDecoder::forward(const std::vector<float>& hidden, const std::vector<i
 
 
 std::vector<int> DepthDecoder::sample_frame(const std::vector<float>& hidden, float temperature,
-                                            uint64_t seed) const {
+                                            uint64_t seed, const std::vector<std::vector<int>>& rep_hist,
+                                            float rep_penalty) const {
   static const int kSchedule[] = {4, 4, 4};  // the reference's config.maskgit_schedule
   std::vector<int> order(kCodebooks);
   for (int i = 0; i < kCodebooks; ++i) order[size_t(i)] = i;
   std::mt19937 rng(seed);
   std::shuffle(order.begin(), order.end(), rng);
-  return sample_frame(hidden, temperature, order);
+  return sample_frame(hidden, temperature, order, rep_hist, rep_penalty);
 }
 
 std::vector<int> DepthDecoder::sample_frame(const std::vector<float>& hidden, float temperature,
-                                            const std::vector<int>& order) const {
+                                            const std::vector<int>& order,
+                                            const std::vector<std::vector<int>>& rep_hist,
+                                            float rep_penalty) const {
   static const int kSchedule[] = {4, 4, 4};  // the reference's config.maskgit_schedule
   std::mt19937 rng(0);  // only used when the caller passes a temperature: a fixed stream for the
                         // fixed order (the seeded variant owns its shuffle stream)
@@ -264,6 +267,8 @@ std::vector<int> DepthDecoder::sample_frame(const std::vector<float>& hidden, fl
     std::vector<uint8_t> masked(kCodebooks);
     for (int i = 0; i < kCodebooks; ++i) masked[size_t(i)] = !revealed[size_t(i)];
     forward(hidden, codes, masked, logits);
+    if (!rep_hist.empty() && rep_penalty != 1.0f)
+      apply_repetition_penalty(logits, rep_hist, rep_penalty);  // the all-masked logits, per codebook
     for (int j = 0; j < kSchedule[pass]; ++j) {
       const int c = order[size_t(pick++)];
       if (temperature <= 0) {
@@ -403,16 +408,19 @@ void DepthDecoder::load_gpu() {
 
 
 std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden, float temperature,
-                                                uint64_t seed) {
+                                                uint64_t seed, const std::vector<std::vector<int>>& rep_hist,
+                                                float rep_penalty) {
   std::vector<int> order(kCodebooks);
   for (int i = 0; i < kCodebooks; ++i) order[size_t(i)] = i;
   std::mt19937 shuf(seed);
   std::shuffle(order.begin(), order.end(), shuf);
-  return sample_frame_gpu(hidden, temperature, order);
+  return sample_frame_gpu(hidden, temperature, order, rep_hist, rep_penalty);
 }
 
 std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden, float temperature,
-                                                const std::vector<int>& order) {
+                                                const std::vector<int>& order,
+                                                const std::vector<std::vector<int>>& rep_hist,
+                                                float rep_penalty) {
   if (!gpu_ready_) load_gpu();
   if (hidden.size() != size_t(kTextHidden)) die("the hidden must be one frame's 2048 values");
   GpuW& W = *gw_;
@@ -566,9 +574,11 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
     // fast path (ordering this buffer with the engine's step for <10 ms frames) is unverified on a
     // GPU serve run; NI_TTS_READOUT_MS overrides the bound for diagnosis.
     const double readout_ms = getenv("NI_TTS_READOUT_MS") ? std::atof(getenv("NI_TTS_READOUT_MS")) : 2000.0;
-    if (!e->wait_for(readout_ms)) return sample_frame(hidden, temperature, order);
+    if (!e->wait_for(readout_ms)) return sample_frame(hidden, temperature, order, rep_hist, rep_penalty);
     e = Gpu::get().begin();
     memcpy(logits_host.data(), W.logits.ptr(), logits_host.size() * 4);
+    if (!rep_hist.empty() && rep_penalty != 1.0f)
+      apply_repetition_penalty(logits_host, rep_hist, rep_penalty);  // the all-masked logits, per codebook
     // the reveal (the CPU sampler's tail, unchanged)
     for (int j = 0; j < kSchedule[pass]; ++j) {
       const int c = order[size_t(pick++)];

@@ -167,6 +167,9 @@ class Lfm3 : public Model {
   std::unique_ptr<tts::CodecDecoder> codec_;
   int audio_out_token_ = -1, audio_eos_code_ = -1;
   float audio_temperature_ = 0.0f;
+  float audio_rep_penalty_ = 1.0f;  // the reference's n_penalty (the audio repetition penalty; 1.0 = none)
+  int audio_rep_window_ = 0;         // its n_window (the last n frames' codes per codebook)
+  std::vector<std::vector<int>> rep_hist_;  // the reply's per-codebook codes, one row per frame (capped)
   bool speech_forced_ = false;  // the speech slots force <|audio_out|> (the audio mode's mask)
 };
 

@@ -464,6 +464,7 @@ int Lfm3::audio_eos_code() const {
 
 void Lfm3::set_speech_mode(bool on) {
   speech_forced_ = on;
+  if (on) rep_hist_.clear();  // a fresh speech reply: the repetition penalty's window starts empty
   if (on && !tts_) load_tts();  // the first speech slot's forcing needs the weights in place
 }
 
@@ -477,6 +478,8 @@ void Lfm3::load_tts() {
   audio_out_token_ = gc.value("audio_out_token_id", -1);
   audio_eos_code_ = gc.value("audio_eos_code", -1);
   audio_temperature_ = gc.value("audio_temperature", 0.0f);
+  audio_rep_penalty_ = gc.value("audio_repetition_penalty", 1.0f);  // the reference's n_penalty; 1.0 = none
+  audio_rep_window_ = gc.value("audio_repetition_window", 0);       // its n_window
   tts_ = std::make_unique<tts::DepthDecoder>(gen);
   logi("tts: the depth decoder loaded (%d codebooks, audio_out token %d)", gc.value("num_codebooks", 12),
        audio_out_token_);
@@ -502,9 +505,22 @@ std::vector<int> Lfm3::speech_frame(uint64_t seed) {
   // the last step's pre-head state (xn_ holds the final-normed hidden the head read) — read back
   std::vector<float> hidden(size_t(cfg_.hidden));
   memcpy(hidden.data(), xn_.as<float>(), hidden.size() * 4);
+  // the audio repetition penalty: the per-codebook codes this reply emitted in the last
+  // audio_rep_window_ frames (rep_hist_), fed to the sampler. Empty when the window is 0, so the
+  // default (no penalty / no window) keeps the pre-wiring behaviour byte-identical.
+  const int kCB = tts::DepthDecoder::kCodebooks;
+  std::vector<std::vector<int>> cb_hist(kCB);
+  const int F = int(rep_hist_.size()), start = std::max(0, F - audio_rep_window_);
+  for (int f = start; f < F; ++f)
+    for (int c = 0; c < kCB; ++c)
+      cb_hist[size_t(c)].push_back(rep_hist_[size_t(f)][size_t(c)]);
   // the depth decoder's per-frame Metal path (the CPU forward stays the oracle); the first
   // frame loads the weights once (audio-gen.safetensors, bf16 on the device).
-  return tts_->sample_frame_gpu(hidden, audio_temperature_, seed);
+  std::vector<int> frame =
+      tts_->sample_frame_gpu(hidden, audio_temperature_, seed, cb_hist, audio_rep_penalty_);
+  rep_hist_.push_back(frame);
+  if (audio_rep_window_ > 0 && rep_hist_.size() > size_t(audio_rep_window_)) rep_hist_.erase(rep_hist_.begin());
+  return frame;
 }
 
 // x's rows through an RMSNorm (norm's weight) into y as halfs; without a norm, plain halfs.

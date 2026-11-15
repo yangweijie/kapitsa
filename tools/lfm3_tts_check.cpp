@@ -156,6 +156,23 @@ int main(int argc, char** argv) {
     ok("the audio repetition penalty: repeated codes down-weighted (HF form, dedup), 1.0 a no-op",
        div_ok && mul_ok && noop_ok, "div " + std::to_string(o5) + " / mul " + std::to_string(o7));
   }
+  {
+    // the penalty is EFFECTIVE end to end: a strong penalty (n_penalty form) on the codes the
+    // sampler just emitted moves the frame's argmax — the repeated code is down-weighted off the top.
+    // (CPU oracle; deterministic for the seeded hidden + the fixed reveal order.)
+    const auto& rec0 = meta["records"][0];
+    const std::vector<float> hid0 = rec0["hidden"].get<std::vector<float>>();
+    std::vector<int> fixed(12);
+    for (int i = 0; i < 12; ++i) fixed[size_t(i)] = i;
+    const std::vector<int> no_pen = dec.sample_frame(hid0, 0.0f, fixed);  // defaults: no history/penalty
+    std::vector<std::vector<int>> rep(ni::tts::DepthDecoder::kCodebooks);
+    for (int c = 0; c < ni::tts::DepthDecoder::kCodebooks; ++c) rep[size_t(c)].push_back(no_pen[size_t(c)]);
+    const std::vector<int> penal = dec.sample_frame(hid0, 0.0f, fixed, rep, 1e6f);  // a strong penalty on the repeats
+    int diffs = 0;
+    for (int c = 0; c < ni::tts::DepthDecoder::kCodebooks; ++c) diffs += no_pen[size_t(c)] != penal[size_t(c)];
+    ok("the audio repetition penalty is effective: a strong penalty on the just-emitted codes moves the frame",
+       diffs >= 1, "moved " + std::to_string(diffs) + " of " + std::to_string(ni::tts::DepthDecoder::kCodebooks) + " codebooks");
+  }
   printf("PASS (%d ok, %d failed)\n", passed, failed);
   return failed ? 1 : 0;
 }

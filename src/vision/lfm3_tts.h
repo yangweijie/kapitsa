@@ -34,19 +34,30 @@ class DepthDecoder {
   // One speech frame from a language-model hidden state (the reference's sample_audio_frame): the
   // 12 codebooks revealed in a seeded random order over the maskgit_schedule passes ([4, 4, 4] —
   // each pass scores the still-hidden codebooks jointly), argmax at temperature 0, softmax at > 0.
-  std::vector<int> sample_frame(const std::vector<float>& hidden, float temperature, uint64_t seed) const;
+  // rep_hist (kCodebooks x recent codes, the reference's n_window) + rep_penalty down-weight a
+  // code the codebook just emitted (HF's RepetitionPenaltyLogitsProcessor form); a penalty of 1.0
+  // (the default) or an empty history is a no-op.
+  std::vector<int> sample_frame(const std::vector<float>& hidden, float temperature, uint64_t seed,
+                                const std::vector<std::vector<int>>& rep_hist = {},
+                                float rep_penalty = 1.0f) const;
   // The same with a fixed reveal order (the checks' form: with order {0..11} the first pass's codes
   // are exactly the all-masked argmax of codebooks 0-3).
   std::vector<int> sample_frame(const std::vector<float>& hidden, float temperature,
-                                const std::vector<int>& order) const;
+                                const std::vector<int>& order,
+                                const std::vector<std::vector<int>>& rep_hist = {},
+                                float rep_penalty = 1.0f) const;
   // The GPU form (Metal kernels, src/kernels/tts.metal; the CPU forward stays the oracle). The
   // weights ride to the device once (load_gpu); each call is one frame's three MaskGIT passes.
   // The caller holds the GPU turn. F must be 1 (the decode shape).
   bool gpu_ready() const { return gpu_ready_; }
   void load_gpu();
-  std::vector<int> sample_frame_gpu(const std::vector<float>& hidden, float temperature, uint64_t seed);
+  std::vector<int> sample_frame_gpu(const std::vector<float>& hidden, float temperature, uint64_t seed,
+                                   const std::vector<std::vector<int>>& rep_hist = {},
+                                   float rep_penalty = 1.0f);
   std::vector<int> sample_frame_gpu(const std::vector<float>& hidden, float temperature,
-                                    const std::vector<int>& order);
+                                    const std::vector<int>& order,
+                                    const std::vector<std::vector<int>>& rep_hist = {},
+                                    float rep_penalty = 1.0f);
 
   // The audio repetition penalty (the reference's n_penalty on the codes each codebook emitted in
   // the last n_window frames), HF's RepetitionPenaltyLogitsProcessor form: for each codebook c and
