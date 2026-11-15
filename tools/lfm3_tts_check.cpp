@@ -190,6 +190,38 @@ int main(int argc, char** argv) {
     // trunk's fp32 near-tie band, the pen_same count above)
     ok("the depth decoder's GPU repetition penalty is effective: a strong penalty moves the just-emitted codes off the top",
        moved_gpu >= 10, "moved " + std::to_string(moved_gpu) + " of 12 codebooks");
+    // the rep-penalty's DEFAULT-ON interleaved A/B + output check (the AGENTS.md posture; the M5-Pro
+    // half of the >=2-setups evidence for the rep-penalty being on by default): a MILD config-like
+    // penalty (n_penalty 1.2, the reply's just-emitted codes as a 3-frame window) applied through the
+    // GPU path, interleaved penalty-on vs no-penalty over 5 rounds. Assertions: the GPU's penalized
+    // codes match the CPU oracle's penalized codes (the penalty is applied faithfully on the GPU), and
+    // the no-penalty run is a byte-identical no-op vs the reference (the on-by-default feature is
+    // safe when a config has no penalty). Reuses no_pen (the no-penalty CPU reference, above).
+    {
+      std::vector<std::vector<int>> w(12);
+      for (int c = 0; c < 12; ++c)
+        for (int i = 0; i < 3; ++i) w[size_t(c)].push_back(no_pen[size_t(c)]);
+      const float P = 1.2f;  // a mild, config-realistic n_penalty (the reference's default is 1.0 = off)
+      int faithful = 0, noop = 0, effect = 0;
+      for (int r = 0; r < 5; ++r) {
+        const std::vector<int> gp = gdec.sample_frame_gpu(hidden, 0.0f, fixed, w, P);
+        const std::vector<int> gn = gdec.sample_frame_gpu(hidden, 0.0f, fixed, w, 1.0f);
+        const std::vector<int> cp = dec.sample_frame(hidden, 0.0f, fixed, w, P);
+        int band = 0, no = 0, mv = 0;
+        for (int c = 0; c < 12; ++c) {
+          band += gp[c] == cp[c];
+          no += gn[c] == no_pen[c];
+          mv += gp[c] != gn[c];
+        }
+        faithful += band >= 10;
+        noop += no == 12;
+        effect = mv;
+      }
+      ok("the rep-penalty default-on A/B: 5 interleaved rounds, a mild n_penalty=1.2 the GPU applies faithfully (matches the CPU oracle), 1.0 a byte-identical no-op",
+         faithful >= 4 && noop == 5,
+         "faithful " + std::to_string(faithful) + "/5, no-op " + std::to_string(noop) +
+             "/5, mild-penalty effect moved " + std::to_string(effect) + " of 12");
+    }
   }
   {
     // the audio repetition penalty (the reference's n_penalty on the codes each codebook emitted in
