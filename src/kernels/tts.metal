@@ -159,14 +159,18 @@ using namespace metal;
 }
 
 // the adds staging for a pass: per codebook row, the revealed code's embedding (the 12 embedding
-// tables are the bound slots) or the mask embedding. One thread per (c, hidden).
+// tables are the bound slots) or the mask embedding. One thread per (c, hidden). The codebook
+// embedding is a bf16 checkpoint tensor -- the SAME tensor tts_gemv binds as the slot's tied head
+// weight -- so read it as bfloat (2 B/elt) to match its layout; a `device float*` read doubled the
+// byte index and ran ~4 MB past the [2017,1024] table -> the BIF0 page fault that wedged the GPU.
+// The adds (W.x) and the mask embedding stay fp32; the gathered bf16 value is widened to fp32.
 [[kernel]] void tts_fill_adds(device float* adds [[buffer(0)]],
-                              const device float* emb0 [[buffer(1)]],  const device float* emb1 [[buffer(2)]],
-                              const device float* emb2 [[buffer(3)]],  const device float* emb3 [[buffer(4)]],
-                              const device float* emb4 [[buffer(5)]],  const device float* emb5 [[buffer(6)]],
-                              const device float* emb6 [[buffer(7)]],  const device float* emb7 [[buffer(8)]],
-                              const device float* emb8 [[buffer(9)]],  const device float* emb9 [[buffer(10)]],
-                              const device float* emb10 [[buffer(11)]], const device float* emb11 [[buffer(12)]],
+                              const device bfloat* emb0 [[buffer(1)]],  const device bfloat* emb1 [[buffer(2)]],
+                              const device bfloat* emb2 [[buffer(3)]],  const device bfloat* emb3 [[buffer(4)]],
+                              const device bfloat* emb4 [[buffer(5)]],  const device bfloat* emb5 [[buffer(6)]],
+                              const device bfloat* emb6 [[buffer(7)]],  const device bfloat* emb7 [[buffer(8)]],
+                              const device bfloat* emb8 [[buffer(9)]],  const device bfloat* emb9 [[buffer(10)]],
+                              const device bfloat* emb10 [[buffer(11)]], const device bfloat* emb11 [[buffer(12)]],
                               const device float* mask [[buffer(13)]],
                               const device int* codes [[buffer(14)]],  const device uchar* revealed [[buffer(15)]],
                               uint id [[thread_position_in_grid]]) {
@@ -174,13 +178,13 @@ using namespace metal;
   const uint c = id / 1024u, h = id % 1024u;
   if (!revealed[c]) { adds[id] = mask[h]; return; }
   const int k = codes[c];
-  const device float* e;
+  const device bfloat* e;
   switch (c) {
     case 0: e = emb0; break; case 1: e = emb1; break; case 2: e = emb2; break; case 3: e = emb3; break;
     case 4: e = emb4; break; case 5: e = emb5; break; case 6: e = emb6; break; case 7: e = emb7; break;
     case 8: e = emb8; break; case 9: e = emb9; break; case 10: e = emb10; break; default: e = emb11; break;
   }
-  adds[id] = e[size_t(k) * 1024u + h];
+  adds[id] = float(e[size_t(k) * 1024u + h]);
 }
 
 // the pass's reveal: for each codebook the host marked selected this pass (the MaskGIT schedule

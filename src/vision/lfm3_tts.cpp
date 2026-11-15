@@ -369,6 +369,14 @@ void DepthDecoder::load_gpu() {
   f32_upload(W.mask_emb, mask_embedding_);
   f32_upload(W.final_norm, final_norm_);
   for (int c = 0; c < kCodebooks; ++c) {
+    // bf16: W.emb[c] is the codebook's [2017,1024] embedding tensor, a bf16 checkpoint value, and it
+    // is bound TWO ways -- tts_gemv reads it as the slot's tied head weight, and tts_fill_adds reads
+    // it as the reveal's embedding gather. Both must match its 2-byte (bfloat) layout; tts_fill_adds
+    // used to read it as a `device float*`, doubling the byte index and running ~4 MB past the table
+    // -> the BIF0 page fault that wedged the GPU (masked as zeroes by the MTL validation layer, so
+    // "all green under the layers" was a FALSE pass; the production JIT faults). Uploading it fp32
+    // to match one reader would mis-type the other (tts_gemv's bfloat read), so the bf16 upload is
+    // the faithful one -- and tts_fill_adds now widens its gathered bfloat to fp32 for the adds.
     bf16_upload(W.emb[c], codebooks_[size_t(c)].embedding);
     f32_upload(W.emb_norm[c], codebooks_[size_t(c)].norm);
   }
