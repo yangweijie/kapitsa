@@ -123,7 +123,8 @@ CodecDecoder::CodecDecoder(const std::string& safetensors) {
   }
 }
 
-void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector<float>& audio) const {
+void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector<float>& audio,
+                          StageProbe* probe) const {
   const int F = frames;
   if (int(codes.size()) != kCodebooks * F) die("shape mismatch");
   const float eps = 1e-5f;
@@ -353,6 +354,7 @@ void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector
   // 5. the final norm, the STFT head, the iSTFT with the envelope and the trim
   for (int t = 0; t < T; ++t)
     rms_norm(tmp.data() + size_t(t) * kHidden, x.data() + size_t(t) * kHidden, final_norm_.data(), kHidden, eps);
+  if (probe) probe->final0.assign(tmp.data(), tmp.data() + 4);  // the trunk's frame-0 final-norm state
   if (dbg) {
     fprintf(stderr, "stages final [0][:4]:");
     for (int j = 0; j < 4; ++j) fprintf(stderr, " %.6f", tmp[j]);
@@ -373,6 +375,7 @@ void CodecDecoder::decode(const std::vector<int>& codes, int frames, std::vector
     matvec(spec.data() + size_t(t) * bins * 2, tmp.data() + size_t(t) * kHidden, lin_w_.data(), bins * 2, kHidden);
     for (int j = 0; j < bins * 2; ++j) spec[size_t(t) * bins * 2 + j] += lin_b_[size_t(j)];
   }
+  if (probe) probe->logmag0.assign(spec.data(), spec.data() + 4);  // the STFT head's frame-0 log-mags
   if (dbg) {
     size_t bad = 0;
     float lmx = -1e30f, lmn = 1e30f;

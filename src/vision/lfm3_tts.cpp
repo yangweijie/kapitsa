@@ -365,8 +365,13 @@ void DepthDecoder::load_gpu() {
   W.gi = Gpu::get().alloc(size_t(kCodebooks) * kFfn * 4 + 16, "tts_gi");
   W.ui = Gpu::get().alloc(size_t(kCodebooks) * kFfn * 4 + 16, "tts_ui");
   W.logits = Gpu::get().alloc(size_t(kCodebooks) * kCodebookSize * 4 + 16, "tts_logits");
-  W.zero = Gpu::get().alloc(64, "tts_zero");
-  memset(W.zero.ptr(), 0, 64);
+  // the zero pad: the trunk/heads gemv bind this as a no-op bias (the engine rejects a null
+  // buffer), and the kernel reads it as a [out]-long bias. Size it to the largest out that binds
+  // it (the FFN's kFfn=2816, the heads' 2017); a 64-byte pad read past 16 floats was an OOB read
+  // that the MTL validation layer zeroed but the production JIT fed with adjacent memory.
+  const size_t kZeroPad = std::max(size_t(kFfn), size_t(kCodebookSize));
+  W.zero = Gpu::get().alloc(kZeroPad * 4 + 16, "tts_zero");
+  memset(W.zero.ptr(), 0, kZeroPad * 4 + 16);
   gpu_ready_ = true;
 }
 
@@ -397,7 +402,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
     e->buf(2, W.depth_b);
     e->buf(3, W.proj);
     e->val(4, dims);
-    e->dispatch(kCodebooks * kHidden, 1, 1, 64);
+    e->dispatch((kCodebooks * kHidden + 63) / 64, 1, 1, 64);  // group count, not thread count
       }
   // the slot adds (masked: the mask_embedding; revealed: the code's embedding), an element kernel
   // (no dedicated kernel: each slot's row add runs as tts_add over the code/mask embedding pointer
@@ -431,7 +436,10 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
     e->use(Gpu::get().pipeline("tts_add"));
     e->buf(0, y);
     e->buf(1, x);
-    e->dispatch(kCodebooks * kHidden, 1, 1, 256);
+    // the dispatch arg is the group COUNT (dispatchThreadgroups), not the thread count: kHidden
+    // elements over a 256-wide threadgroup is ceil(.../256) groups (the old kHidden-groups form
+    // launched 256x the threads, an OOB read/write on the unguarded element kernel).
+    e->dispatch((kCodebooks * kHidden + 255) / 256, 1, 1, 256);
   };
 
   // the mask/code embeddings: gathered on the host into one [12, 1024] fp32 staging (12 rows of
@@ -494,7 +502,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->use(Gpu::get().pipeline("tts_silu"));
       e->buf(0, W.gi);
       e->buf(1, W.ui);
-      e->dispatch(kCodebooks * kFfn, 1, 1, 256);
+      e->dispatch((kCodebooks * kFfn + 255) / 256, 1, 1, 256);  // group count, not thread count
       gemv_rows(W.tmp, G.w2, W.gi, W.zero, kHidden, kFfn);
       add12(W.x, W.tmp);
           }
@@ -519,7 +527,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->buf(2, W.zero);
       e->buf(3, W.logits, size_t(c) * kCodebookSize * 4);
       e->val(4, dims);
-      e->dispatch(kCodebookSize, 1, 1, 64);
+      e->dispatch((kCodebookSize + 63) / 64, 1, 1, 64);  // 2017 rows, guarded tail
     }
     e->commit_and_wait();   // one command buffer per MaskGIT pass (the CPU reads the logits)
     e = Gpu::get().begin();

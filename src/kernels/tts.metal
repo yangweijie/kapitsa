@@ -44,6 +44,9 @@ using namespace metal;
                             const device float* qn [[buffer(2)]], const device float* kn [[buffer(3)]],
                             constant uint& is_k [[buffer(4)]], uint gi [[thread_position_in_grid]]) {
   const uint hd = 32, hf = 16;
+  // the k case (12 x 8 = 96 threads) is not a multiple of the 64-wide threadgroup, so the last
+  // group's tail threads (96..127) must return before they index the 3072-float k buffer OOB.
+  if (gi >= (is_k ? 8u : 32u) * 12u) return;
   const uint c = gi / (is_k ? 8u : 32u), h = gi % (is_k ? 8u : 32u);
   const uint base = is_k ? c * 256u + h * hd : c * 1024u + h * hd;
   device float* r = is_k ? k + base : q + base;

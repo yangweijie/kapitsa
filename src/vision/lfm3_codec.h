@@ -24,9 +24,20 @@ class CodecDecoder {
 
   explicit CodecDecoder(const std::string& safetensors);  // the Liquid-Codec checkpoint (bf16)
 
+  // the two stage snapshots a per-stage comparison needs (frame 0, first 4 channels each): the
+  // trunk's post-final-norm state and the STFT head's log-magnitude bins (the near-silence lives
+  // here — the reference's log-mags sit around -4, e^-4 ~ 0.014 linear magnitude). Filled by
+  // decode() when a probe is passed; the C++ values track the reference's fp32 decode to ~1e-5.
+  struct StageProbe {
+    std::vector<float> final0;  // post-final-norm trunk state, frame 0, first 4 of 512
+    std::vector<float> logmag0;  // STFT head's log-magnitude, frame 0, first 4 of 641
+  };
+
   // codes: kCodebooks x F; audio: the decoded samples (kTrim-trimmed at both ends), fp32.
   // scales with F (the trunk is causal over the 6F upsampled frames; no streaming cache yet).
-  void decode(const std::vector<int>& codes, int frames, std::vector<float>& audio) const;
+  // probe: optional per-stage snapshots (the near-silence's stage, the STFT head).
+  void decode(const std::vector<int>& codes, int frames, std::vector<float>& audio,
+              StageProbe* probe = nullptr) const;
 
  private:
   struct Layer {

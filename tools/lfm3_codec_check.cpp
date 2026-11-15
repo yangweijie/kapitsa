@@ -24,6 +24,7 @@ json parse(const std::string& p) {
 int main(int argc, char** argv) {
   const char* codec_path = argc > 1 ? argv[1] : "/Volumes/data/.hf-dl/liquid-codec/model.safetensors";
   const char* golden_dir = argc > 2 ? argv[2] : ".lfm3-real/tts-golden";
+  const char* stages_json = argc > 3 ? argv[3] : ".lfm3-real/tts-stages-eager.json";
   const json meta = parse(std::string(golden_dir) + "/codes.json");
   std::ifstream gf(std::string(golden_dir) + "/golden.f32", std::ios::binary);
   if (!gf.good()) {
@@ -40,7 +41,8 @@ int main(int argc, char** argv) {
 
   ni::tts::CodecDecoder dec(codec_path);
   std::vector<float> got;
-  dec.decode(codes, frames, got);
+  ni::tts::CodecDecoder::StageProbe probe;
+  dec.decode(codes, frames, got, &probe);  // the per-stage snapshots ride the same decode
 
   int passed = 0, failed = 0;
   auto ok = [&](const std::string& name, bool good, const std::string& detail = "") {
@@ -78,6 +80,36 @@ int main(int argc, char** argv) {
   {
     std::ofstream wf(std::string(golden_dir) + "/got.f32", std::ios::binary);
     wf.write(reinterpret_cast<const char*>(got.data()), long(got.size() * 4));
+  }
+  // the per-stage snapshots (the near-silence's stage, the STFT head): the C++'s trunk-final state
+  // and STFT-head log-mags vs the reference's stage dump (tests/tts/ref_codec_stages.py). This is
+  // what localizes the near-silence: the reference's own log-mags sit around -4 (e^-4 ~ 0.014
+  // linear), so a quiet decode is the codes'/reference's, not a C++ scaling bug. Skipped when the
+  // reference dump is not present (its sibling of the golden bundle), so the metric holds off-box.
+  {
+    std::ifstream sf(stages_json);
+    if (!sf.good()) {
+      printf("ok the codec's per-stage snapshots: skipped (no reference stage dump at %s)\n", stages_json);
+      ++passed;
+    } else {
+      const json sref = parse(stages_json);
+      auto near = [](const std::vector<float>& got, const json& want) {
+        for (size_t i = 0; i < want.size() && i < got.size(); ++i) {
+          const double w = want[i].get<double>();
+          if (std::fabs(got[i] - w) > 1e-3 * std::max(1.0, std::fabs(w))) return false;
+        }
+        return true;
+      };
+      const bool final_ok = near(probe.final0, sref["final"]);
+      const bool logmag_ok = near(probe.logmag0, sref["spec_logmag"]);
+      ok("the codec's per-stage snapshots match the reference (trunk-final + STFT-head log-mag, "
+         "the near-silence's stage)",
+         final_ok && logmag_ok,
+         "final[0] " + std::to_string(probe.final0[0]) +
+             " ref " + std::to_string(sref["final"][0].get<double>()) +
+             " ; logmag[0] " + std::to_string(probe.logmag0[0]) +
+             " ref " + std::to_string(sref["spec_logmag"][0].get<double>()));
+    }
   }
   printf("PASS (%d ok, %d failed)\n", passed, failed);
   return failed ? 1 : 0;
