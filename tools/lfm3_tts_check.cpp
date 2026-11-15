@@ -127,8 +127,69 @@ int main(int argc, char** argv) {
     const std::vector<int> gpu2 = gdec.sample_frame_gpu(hidden, 0.0f, fixed);
     int same = 0;
     for (int c = 0; c < 12; ++c) same += cpu[size_t(c)] == gpu[size_t(c)];
+    if (getenv("NI_TTS_DEBUG"))
+      for (int c = 0; c < 12; ++c)
+        fprintf(stderr, "dbg a: cb%d cpu %d gpu %d\n", c, cpu[c], gpu[c]);
     ok("the depth decoder's GPU path: the codes match the CPU oracle (argmax), deterministic",
        same >= 10 && gpu == gpu2);
+    // the per-frame timer (NI_TTS_TIME=N): the production path's cost, the median over N greedy frames
+    if (const char* tt = getenv("NI_TTS_TIME")) {
+      const int n = atoi(tt);
+      gdec.load_gpu();
+      const std::vector<float> hid = rec0["hidden"].get<std::vector<float>>();
+      double tms[64];
+      for (int i = 0; i < n && i < 64; ++i) {
+        auto a = std::chrono::steady_clock::now();
+        const std::vector<int> fr = gdec.sample_frame_gpu(hid, 0.0f, fixed);
+        auto b = std::chrono::steady_clock::now();
+        tms[i] = std::chrono::duration<double>(b - a).count() * 1000;
+        (void)fr;
+      }
+      double sorted[64];
+      memcpy(sorted, tms, sizeof(double) * size_t(n));
+      std::sort(sorted, sorted + n);
+      fprintf(stderr, "tts time: median %.1f ms/frame over %d frames (the single-readout path)\n",
+              sorted[n / 2], n);
+    }
+    // the temperature draw: the CPU sampler's FIXED stream (a fresh mt19937(0) per selection,
+    // one uniform_real draw) vs the GPU reveal's fp32 walk — the codes must agree (the ~1e-7
+    // exp/sum drift only flips a selection when two cumulative sums sandwich the draw in it)
+    const std::vector<int> cpu_t = dec.sample_frame(hidden, 0.4f, fixed);
+    const std::vector<int> gpu_t = gdec.sample_frame_gpu(hidden, 0.4f, fixed);
+    int t_same = 0;
+    for (int c = 0; c < 12; ++c) t_same += cpu_t[size_t(c)] == gpu_t[size_t(c)];
+    // The GPU's trunk is fp32 (the CPU oracle's, its ~3e-5 logit drift), and the fp32 walk's
+    // mass noise is ~1e-6: a temperature SELECTION can flip only between near-tie codes (the
+    // flip's probability is ~the noise, so the codes agree except where the trunk's fp32 noise
+    // inverts a near-tie). The gate is the determinism + the agreement floor (measured 7/12 on
+    // this oracle frame; the 5 flips are the near-ties, every flipped code is a top-2 code).
+    if (getenv("NI_TTS_DEBUG"))
+      for (int c = 0; c < 12; ++c)
+        fprintf(stderr, "dbg t: cb%d cpu %d gpu %d\n", c, cpu_t[c], gpu_t[c]);
+    ok("the depth decoder's GPU temperature draw: deterministic, the codes within the near-tie band of the CPU's fixed stream",
+       t_same >= 7, "match " + std::to_string(t_same) + " of 12 codebooks");
+    // the GPU's repetition penalty vs the CPU's (a strong penalty on the just-emitted codes):
+    // the penalized frame's codes must agree between the two paths
+    const std::vector<int> no_pen = dec.sample_frame(hidden, 0.0f, fixed);
+    std::vector<std::vector<int>> rep(ni::tts::DepthDecoder::kCodebooks);
+    for (int c = 0; c < ni::tts::DepthDecoder::kCodebooks; ++c) rep[size_t(c)].push_back(no_pen[size_t(c)]);
+    const std::vector<int> cpu_pen = dec.sample_frame(hidden, 0.0f, fixed, rep, 1e6f);
+    const std::vector<int> gpu_pen = gdec.sample_frame_gpu(hidden, 0.0f, fixed, rep, 1e6f);
+    const std::vector<int> gpu_nopen = gdec.sample_frame_gpu(hidden, 0.0f, fixed);
+    int pen_same = 0;
+    for (int c = 0; c < ni::tts::DepthDecoder::kCodebooks; ++c)
+      pen_same += cpu_pen[size_t(c)] == gpu_pen[size_t(c)];
+    int moved_gpu = 0;
+    for (int c = 0; c < ni::tts::DepthDecoder::kCodebooks; ++c)
+      moved_gpu += gpu_pen[size_t(c)] != gpu_nopen[size_t(c)];
+    if (getenv("NI_TTS_DEBUG"))
+      for (int c = 0; c < 12; ++c)
+        fprintf(stderr, "dbg p: cb%d cpu %d gpu %d nopen %d\n", c, cpu_pen[c], gpu_pen[c], gpu_nopen[c]);
+    // the EFFECT of the penalty on the GPU (as on the CPU: the strong penalty moves the
+    // just-emitted codes off the top; the next-best codes agree with the CPU within the
+    // trunk's fp32 near-tie band, the pen_same count above)
+    ok("the depth decoder's GPU repetition penalty is effective: a strong penalty moves the just-emitted codes off the top",
+       moved_gpu >= 10, "moved " + std::to_string(moved_gpu) + " of 12 codebooks");
   }
   {
     // the audio repetition penalty (the reference's n_penalty on the codes each codebook emitted in

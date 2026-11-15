@@ -132,3 +132,99 @@ using namespace metal;
   for (uint i = 0; i < dims.y; ++i) acc += float(row[i]) * xc[i];
   y[size_t(c) * dims.x + o] = acc + (b ? b[o] : 0.f);
 }
+
+// ---- the MaskGIT reveal on the GPU (one readout per frame instead of one per pass; the CPU
+// sampler in sample_frame is the oracle) ----
+
+// the repetition penalty over the all-masked frame's logits, HF's n_penalty form: a code in
+// codebook c's recent window (the host-packed int rows, -1 terminated, up to 64 codes each)
+// divides the positive logits by the penalty (penalty > 1) or multiplies the negative ones
+// (penalty < 1), deduplicated per codebook. One thread per (c, k).
+[[kernel]] void tts_pen_logits(device float* lg [[buffer(0)]], const device int* hist [[buffer(1)]],
+                               constant float& pen [[buffer(2)]],
+                               uint id [[thread_position_in_grid]]) {
+  if (pen == 1.0f || id >= 12u * 2017u) return;
+  const uint c = id / 2017u, k = id % 2017u;
+  const device int* hc = hist + size_t(c) * 64u;
+  bool seen = false;
+  for (int i = 0; i < 64; ++i) {
+    const int v = hc[i];
+    if (v < 0) break;
+    if (v == int(k)) { seen = true; break; }  // dedup: a code in several window frames once
+  }
+  if (!seen) return;
+  const float v = lg[id];
+  if (pen > 1.0f && v > 0.0f) lg[id] = v / pen;
+  else if (pen < 1.0f && v < 0.0f) lg[id] = v * pen;
+}
+
+// the adds staging for a pass: per codebook row, the revealed code's embedding (the 12 embedding
+// tables are the bound slots) or the mask embedding. One thread per (c, hidden).
+[[kernel]] void tts_fill_adds(device float* adds [[buffer(0)]],
+                              const device float* emb0 [[buffer(1)]],  const device float* emb1 [[buffer(2)]],
+                              const device float* emb2 [[buffer(3)]],  const device float* emb3 [[buffer(4)]],
+                              const device float* emb4 [[buffer(5)]],  const device float* emb5 [[buffer(6)]],
+                              const device float* emb6 [[buffer(7)]],  const device float* emb7 [[buffer(8)]],
+                              const device float* emb8 [[buffer(9)]],  const device float* emb9 [[buffer(10)]],
+                              const device float* emb10 [[buffer(11)]], const device float* emb11 [[buffer(12)]],
+                              const device float* mask [[buffer(13)]],
+                              const device int* codes [[buffer(14)]],  const device uchar* revealed [[buffer(15)]],
+                              uint id [[thread_position_in_grid]]) {
+  if (id >= 12u * 1024u) return;
+  const uint c = id / 1024u, h = id % 1024u;
+  if (!revealed[c]) { adds[id] = mask[h]; return; }
+  const int k = codes[c];
+  const device float* e;
+  switch (c) {
+    case 0: e = emb0; break; case 1: e = emb1; break; case 2: e = emb2; break; case 3: e = emb3; break;
+    case 4: e = emb4; break; case 5: e = emb5; break; case 6: e = emb6; break; case 7: e = emb7; break;
+    case 8: e = emb8; break; case 9: e = emb9; break; case 10: e = emb10; break; default: e = emb11; break;
+  }
+  adds[id] = e[size_t(k) * 1024u + h];
+}
+
+// the pass's reveal: for each codebook the host marked selected this pass (the MaskGIT schedule
+// slice), pick its code from the (penalized) logits — the greedy argmax (mode 0, the CPU's
+// first-max walk, bit-exact in fp32) or the CPU sampler's fixed-stream temperature draw
+// (mode 1: the host's frac is the CPU's one uniform_real draw of a fresh mt19937(0); the mx is
+// the fp32 max of the fp32 quotients — the CPU's double mx over the same quotients, exact — and
+// the exp/sum/walk run in fp32 against the CPU's double: a selection can flip only when two
+// cumulative sums sandwich the draw within that ~1e-7 drift, and the path stays deterministic
+// run to run). The code + the revealed flag land in the GPU state the NEXT pass's
+// tts_fill_adds reads; the frame's codes are the single readout. grid = 12 groups of one
+// thread. MSL has no double, so the walk is fp32 throughout.
+[[kernel]] void tts_reveal(const device float* lg [[buffer(0)]],  // [12, 2017] the pass's penalized logits
+                          device int* codes [[buffer(1)]],      // [12]
+                          device uchar* revealed [[buffer(2)]],  // [12]
+                          const device uchar* sel [[buffer(3)]], // [12] this pass's selected codebooks
+                          constant uint& mode [[buffer(4)]],     // 0 = the greedy argmax, 1 = the temperature draw
+                          constant float& frac [[buffer(5)]],
+                          constant float& temp [[buffer(6)]],
+                          uint c [[threadgroup_position_in_grid]]) {
+  if (c >= 12u || !sel[c]) return;
+  const device float* row = lg + size_t(c) * 2017u;
+  if (mode == 0u) {  // the greedy: the CPU's first-max argmax (lg[k] > bv, k ascending)
+    float bv = -1e30f;
+    int best = 0;
+    for (int k = 0; k < 2017; ++k)
+      if (row[k] > bv) { bv = row[k]; best = k; }
+    codes[c] = best;
+  } else {
+    float mx = -1e30f;
+    for (int k = 0; k < 2017; ++k) {
+      const float q = row[k] / temp;
+      if (q > mx) mx = q;
+    }
+    float sum = 0;
+    for (int k = 0; k < 2017; ++k) sum += metal::exp(row[k] / temp - mx);
+    const float draw = frac * sum;
+    float run = 0;
+    int best = 2016;
+    for (int k = 0; k < 2017; ++k) {
+      run += metal::exp(row[k] / temp - mx);
+      if (draw <= run) { best = k; break; }
+    }
+    codes[c] = best;
+  }
+  revealed[c] = 1;
+}

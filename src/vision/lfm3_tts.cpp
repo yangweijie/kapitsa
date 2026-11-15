@@ -331,6 +331,16 @@ void DepthDecoder::apply_repetition_penalty(std::vector<float>& logits,
   }
 }
 
+// the CPU sampler's fixed stream: every temperature selection is a fresh mt19937(0) + ONE
+// uniform_real draw in [0, sum), and that one draw is frac * sum (libc++'s uniform_real is a
+// single 32-bit stream value, probed bit-exact) — the GPU's reveal reproduces the CPU's code
+// selection with this host constant.
+static const double kDrawFrac = [] {
+  std::mt19937 r(0);
+  std::uniform_real_distribution<double> u(0.0, 1.0);
+  return u(r);
+}();
+
 // ---- the GPU path (src/kernels/tts.metal; the CPU forward above is the oracle) ----
 
 // The fp32 host copy as bf16 into a device buffer (the checkpoint's weights are bf16; the load
@@ -438,12 +448,8 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
     e->val(4, dims);
     e->dispatch((kCodebooks * kHidden + 63) / 64, 1, 1, 64);  // group count, not thread count
       }
-  // the slot adds (masked: the mask_embedding; revealed: the code's embedding), an element kernel
-  // (no dedicated kernel: each slot's row add runs as tts_add over the code/mask embedding pointer
-  //  selected on the host — 12 host-side selections, 12 small dispatches through one encoder)
+  // the frame's codes (the GPU reveal's return); the slot adds are the GPU gather's, below
   std::vector<int> codes(kCodebooks, 0);
-  std::vector<uint8_t> revealed(kCodebooks, 0);
-  static const int kSchedule[] = {4, 4, 4};
 
   // the trunk's weights are ONE shared [out, in] matrix applied to each of the 12 slots:
   // tts_gemv12's grid is (out, 12), one thread per (output row, slot)
@@ -476,29 +482,50 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
     e->dispatch((kCodebooks * kHidden + 255) / 256, 1, 1, 256);
   };
 
-  // the mask/code embeddings: gathered on the host into one [12, 1024] fp32 staging (12 rows of
-  // either the mask embedding or one code's embedding) and added once
-  const Buffer adds = Gpu::get().alloc(size_t(kCodebooks) * kHidden * 4 + 16, "tts_adds");
-  auto fill_adds = [&] {
-    auto* h = adds.as<float>();
-    for (int c = 0; c < kCodebooks; ++c) {
-      const float* src = revealed[size_t(c)] ? codebooks_[size_t(c)].embedding.data() +
-                                                       size_t(codes[size_t(c)]) * kHidden
-                                             : mask_embedding_.data();
-      memcpy(h + size_t(c) * kHidden, src, size_t(kHidden) * 4);
-    }
+  // ---- the MaskGIT reveal on the GPU (one readout per frame; the CPU sampler is the oracle) ----
+  // the pass's x = the mask/code embeddings of all 12 slots (the GPU gather replaces the host
+  // staging) + the proj
+  std::vector<uint8_t> sel(12, 0);
+  const Buffer cbuf = Gpu::get().alloc(12 * 4 + 16, "tts_codes");
+  const Buffer rbuf = Gpu::get().alloc(16, "tts_rev");
+  memset(cbuf.ptr(), 0, 12 * 4 + 16);
+  memset(rbuf.ptr(), 0, 16);
+  // the repetition penalty's window, host-packed per codebook (-1 terminated, 64 each)
+  const Buffer hbuf = Gpu::get().alloc(12 * 64 * 4 + 16, "tts_hist");
+  int* hp = reinterpret_cast<int*>(hbuf.ptr());
+  for (int c = 0; c < kCodebooks; ++c)
+    for (int i = 0; i < 64; ++i)
+      hp[size_t(c) * 64 + i] = (c < int(rep_hist.size()) && i < int(rep_hist[size_t(c)].size())) ?
+                                   int(rep_hist[size_t(c)][size_t(i)]) : -1;
+  auto fill_adds_gpu = [&] {
+    e->use(Gpu::get().pipeline("tts_fill_adds"));
+    e->buf(0, W.x);
+    for (int c = 0; c < kCodebooks; ++c) e->buf(1 + c, W.emb[size_t(c)]);
+    e->buf(13, W.mask_emb);
+    e->buf(14, cbuf);
+    e->buf(15, rbuf);
+    e->dispatch((kCodebooks * kHidden + 255) / 256, 1, 1, 256);
   };
-
+  auto reveal = [&] {
+    e->use(Gpu::get().pipeline("tts_reveal"));
+    e->buf(0, W.logits);
+    e->buf(1, cbuf);
+    e->buf(2, rbuf);
+    e->bytes(3, sel.data(), 12);
+    e->val(4, temperature <= 0.0f ? 0u : 1u);  // 0 = the greedy argmax, 1 = the fixed-stream draw
+    e->val(5, float(kDrawFrac));  // the MSL walk is fp32 (MSL has no double)
+    e->val(6, temperature);
+    e->dispatch(kCodebooks, 1, 1, 1);
+  };
   int pick = 0;
-  std::vector<float> logits_host(size_t(kCodebooks) * kCodebookSize);
+  std::vector<float> logits_host_dummy;  // unused: the readback is the codes, not the logits
+  (void)logits_host_dummy;
+  static const int kSchedule[] = {4, 4, 4};
   for (int pass = 0; pass < 3; ++pass) {
-    std::vector<uint8_t> masked(kCodebooks);
-    for (int i = 0; i < kCodebooks; ++i) masked[size_t(i)] = !revealed[size_t(i)];
-    fill_adds();
-    // x = proj + adds
-    memcpy(W.x.ptr(), adds.ptr(), size_t(kCodebooks) * kHidden * 4);
+    sel.assign(kCodebooks, 0);
+    for (int j = 0; j < kSchedule[pass]; ++j) sel[size_t(order[size_t(pick++)])] = 1;
+    fill_adds_gpu();
     add12(W.x, W.proj);
-    
     // the trunk: 3 layers
     for (int l = 0; l < kLayers; ++l) {
       const GpuW::LG& G = W.L[size_t(l)];
@@ -507,9 +534,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       gemv_rows(W.k, G.k, W.xn, W.zero, kKvHeads * kHeadDim, kHidden);
       gemv_rows(W.v, G.v, W.xn, W.zero, kKvHeads * kHeadDim, kHidden);
       gemv_rows(W.gated, G.gate, W.xn, W.zero, kHeads, kHidden);
-            // the q/k rope + the q/k norms (32+8 heads per slot, one thread per head)
-      // two separate encoder segments: val() writes the argument buffer the NEXT dispatch
-      // reads, so a second val() before the first dispatch would clobber q's is_k
+      // two separate encoder segments: val() writes the argument buffer the NEXT dispatch reads
       for (uint is_k = 0; is_k < 2; ++is_k) {
         e->use(Gpu::get().pipeline("tts_rope_qk"));
         e->buf(0, W.q);
@@ -518,8 +543,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
         e->buf(3, G.kn);
         e->val(4, is_k);
         e->dispatch(is_k ? kCodebooks * kKvHeads : kCodebooks * kHeads, 1, 1, 64);
-              }
-      // the attention (12 threads in one group) then the o_proj + the residual
+      }
       e->use(Gpu::get().pipeline("tts_attn12"));
       e->buf(0, W.q);
       e->buf(1, W.k);
@@ -527,7 +551,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->buf(3, W.gated);
       e->buf(4, W.att);
       e->dispatch(1, 1, 1, 12);
-            gemv_rows(W.tmp, G.o, W.att, W.zero, kHidden, kHidden);
+      gemv_rows(W.tmp, G.o, W.att, W.zero, kHidden, kHidden);
       add12(W.x, W.tmp);
       // the FFN half
       rms12(W.xn, W.x, G.ffn_norm);
@@ -539,12 +563,11 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->dispatch((kCodebooks * kFfn + 255) / 256, 1, 1, 256);  // group count, not thread count
       gemv_rows(W.tmp, G.w2, W.gi, W.zero, kHidden, kFfn);
       add12(W.x, W.tmp);
-          }
+    }
     // the heads: the final norm, then EACH slot's own embedding_norm (in place), then the
-    // 12 tied [2017, 1024] gemvs. The CPU oracle does both norms — one final_norm over all
-    // slots, then a per-codebook RMSNorm before its head.
+    // 12 tied [2017, 1024] gemvs. The CPU oracle does both norms.
     rms12(W.xn, W.x, W.final_norm);
-        for (int c = 0; c < kCodebooks; ++c) {
+    for (int c = 0; c < kCodebooks; ++c) {
       const float eps = 1e-5f;
       e->use(Gpu::get().pipeline("tts_rms"));
       e->buf(0, W.xn, size_t(c) * kHidden * 4);
@@ -553,7 +576,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->val(3, eps);
       e->dispatch(1, 1, 1, 128);
     }
-        for (int c = 0; c < kCodebooks; ++c) {
+    for (int c = 0; c < kCodebooks; ++c) {
       const Dims dims{kCodebookSize, kHidden};
       e->use(Gpu::get().pipeline("tts_gemv"));
       e->buf(0, W.emb[size_t(c)]);
@@ -563,54 +586,22 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->val(4, dims);
       e->dispatch((kCodebookSize + 63) / 64, 1, 1, 64);  // 2017 rows, guarded tail
     }
-    e->commit();
-    // one command buffer per MaskGIT pass (the CPU reads the logits). A BOUNDED readback: in the
-    // engine this decoder's buffer can queue behind the engine's own in-flight step, so an unbounded
-    // commit_and_wait here wedged the whole command queue on a TTS frame (the CPU blocked in wait,
-    // so the step it queues behind never drained — the circular dependency the 96-frame request timed
-    // out on). Bounding it breaks the cycle: the CPU returns within the bound, the engine's step
-    // drains, later frames complete; a frame that does not land in time falls back to the CPU oracle
-    // (proven to match, 5/5) for that frame — correct but slower — rather than hanging. The Metal
-    // fast path (ordering this buffer with the engine's step for <10 ms frames) is unverified on a
-    // GPU serve run; NI_TTS_READOUT_MS overrides the bound for diagnosis.
-    const double readout_ms = getenv("NI_TTS_READOUT_MS") ? std::atof(getenv("NI_TTS_READOUT_MS")) : 2000.0;
-    if (!e->wait_for(readout_ms)) return sample_frame(hidden, temperature, order, rep_hist, rep_penalty);
-    e = Gpu::get().begin();
-    memcpy(logits_host.data(), W.logits.ptr(), logits_host.size() * 4);
-    if (!rep_hist.empty() && rep_penalty != 1.0f)
-      apply_repetition_penalty(logits_host, rep_hist, rep_penalty);  // the all-masked logits, per codebook
-    // the reveal (the CPU sampler's tail, unchanged)
-    for (int j = 0; j < kSchedule[pass]; ++j) {
-      const int c = order[size_t(pick++)];
-      if (temperature <= 0) {
-        int best = 0;
-        float bv = -1e30f;
-        const float* lg = logits_host.data() + size_t(c) * kCodebookSize;
-        for (int k = 0; k < kCodebookSize; ++k)
-          if (lg[k] > bv) bv = lg[k], best = k;
-        codes[size_t(c)] = best;
-      } else {
-        std::vector<double> p(kCodebookSize);
-        double mx = -1e300, sum = 0;
-        const float* lg = logits_host.data() + size_t(c) * kCodebookSize;
-        for (int k = 0; k < kCodebookSize; ++k) mx = std::max(mx, double(lg[k] / temperature));
-        for (int k = 0; k < kCodebookSize; ++k) sum += p[size_t(k)] = std::exp(double(lg[k] / temperature) - mx);
-        std::uniform_real_distribution<double> uni(0.0, sum);
-        std::mt19937 rng(0);  // the CPU sampler's fixed stream (the same draws)
-        double draw = uni(rng), run = 0;
-        int sel = kCodebookSize - 1;
-        for (int k = 0; k < kCodebookSize; ++k) {
-          run += p[size_t(k)];
-          if (draw <= run) {
-            sel = k;
-            break;
-          }
-        }
-        codes[size_t(c)] = sel;
-      }
-      revealed[size_t(c)] = 1;
+    if (rep_penalty != 1.0f && !rep_hist.empty()) {
+      e->use(Gpu::get().pipeline("tts_pen_logits"));
+      e->buf(0, W.logits);
+      e->buf(1, hbuf);
+      e->val(2, rep_penalty);
+      e->dispatch((kCodebooks * kCodebookSize + 255) / 256, 1, 1, 256);
     }
+    reveal();
   }
+  // one readout for the whole frame (the 3 per-pass readbacks were the 34.6 ms/frame's cost):
+  // the codes are the frame's return, and a BOUNDED readout keeps a wedged kernel from wedging
+  // the engine's command queue (the containment's CPU fallback is the proven-matching oracle)
+  e->commit();
+  const double readout_ms = getenv("NI_TTS_READOUT_MS") ? std::atof(getenv("NI_TTS_READOUT_MS")) : 2000.0;
+  if (!e->wait_for(readout_ms)) return sample_frame(hidden, temperature, order, rep_hist, rep_penalty);
+  memcpy(codes.data(), cbuf.ptr(), size_t(kCodebooks) * sizeof(int));
   return codes;
 }
 
