@@ -529,7 +529,18 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->val(4, dims);
       e->dispatch((kCodebookSize + 63) / 64, 1, 1, 64);  // 2017 rows, guarded tail
     }
-    e->commit_and_wait();   // one command buffer per MaskGIT pass (the CPU reads the logits)
+    e->commit();
+    // one command buffer per MaskGIT pass (the CPU reads the logits). A BOUNDED readback: in the
+    // engine this decoder's buffer can queue behind the engine's own in-flight step, so an unbounded
+    // commit_and_wait here wedged the whole command queue on a TTS frame (the CPU blocked in wait,
+    // so the step it queues behind never drained — the circular dependency the 96-frame request timed
+    // out on). Bounding it breaks the cycle: the CPU returns within the bound, the engine's step
+    // drains, later frames complete; a frame that does not land in time falls back to the CPU oracle
+    // (proven to match, 5/5) for that frame — correct but slower — rather than hanging. The Metal
+    // fast path (ordering this buffer with the engine's step for <10 ms frames) is unverified on a
+    // GPU serve run; NI_TTS_READOUT_MS overrides the bound for diagnosis.
+    const double readout_ms = getenv("NI_TTS_READOUT_MS") ? std::atof(getenv("NI_TTS_READOUT_MS")) : 2000.0;
+    if (!e->wait_for(readout_ms)) return sample_frame(hidden, temperature, order);
     e = Gpu::get().begin();
     memcpy(logits_host.data(), W.logits.ptr(), logits_host.size() * 4);
     // the reveal (the CPU sampler's tail, unchanged)
