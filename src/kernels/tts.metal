@@ -187,6 +187,43 @@ using namespace metal;
   }
 }
 
+// tts_rms's batched form for the 12 slots' OWN embedding norms (the per-slot loop's one
+// dispatch): group c is slot c's row of x/y ([12, 1024]); the per-row gain is w's row c
+// (the contiguous [12, 1024] emb_norm upload). Same math as tts_rms (the mean-square over
+// the row's 1024, the per-row gain, the eps).
+[[kernel]] void tts_rms12(const device float* x [[buffer(0)]], const device float* w [[buffer(1)]],
+                          device float* y [[buffer(2)]], constant float& eps [[buffer(3)]],
+                          uint c [[threadgroup_position_in_grid]], uint j [[thread_position_in_threadgroup]],
+                          uint jn [[threads_per_threadgroup]]) {
+  threadgroup float ss = 0.f;
+  if (j == 0) {
+    float s = 0;
+    const device float* rc = x + size_t(c) * 1024;
+    for (int i = 0; i < 1024; ++i) s += rc[i] * rc[i];
+    ss = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = 1.0f / metal::sqrt(ss / 1024.f + eps);
+  for (uint i = j; i < 1024; i += jn) y[size_t(c) * 1024 + i] = w[size_t(c) * 1024 + i] * x[size_t(c) * 1024 + i] * inv;
+}
+
+// the 12 slots' tied [2017, 1024] head GEMVs in ONE dispatch (the per-slot tts_gemv loop):
+// one thread per (o, c); the weight is the contiguous [12, 2017, 1024] emb_all (tts_fill_adds's
+// gather shares it), x is the slot's own [1024] row, y the [12, 2017] logits.
+[[kernel]] void tts_heads12(const device bfloat* emb_all [[buffer(0)]], const device float* x [[buffer(1)]],
+                            const device float* b [[buffer(2)]], device float* y [[buffer(3)]],
+                            constant uint2& dims [[buffer(4)]],   // (out, in)
+                            uint tid [[thread_position_in_grid]]) {
+  const uint out = dims.x, in = dims.y;
+  if (tid >= out * 12u) return;
+  const uint o = tid % out, c = tid / out;
+  const device bfloat* row = emb_all + (size_t(c) * out + o) * in;
+  const device float* xc = x + size_t(c) * in;
+  float acc = 0;
+  for (uint i = 0; i < in; ++i) acc += float(row[i]) * xc[i];
+  y[size_t(c) * out + o] = acc + (b ? b[o] : 0.f);
+}
+
 // ---- the MaskGIT reveal on the GPU (one readout per frame instead of one per pass; the CPU
 // sampler in sample_frame is the oracle) ----
 
@@ -212,33 +249,23 @@ using namespace metal;
   else if (pen < 1.0f && v < 0.0f) lg[id] = v * pen;
 }
 
-// the adds staging for a pass: per codebook row, the revealed code's embedding (the 12 embedding
-// tables are the bound slots) or the mask embedding. One thread per (c, hidden). The codebook
-// embedding is a bf16 checkpoint tensor -- the SAME tensor tts_gemv binds as the slot's tied head
-// weight -- so read it as bfloat (2 B/elt) to match its layout; a `device float*` read doubled the
-// byte index and ran ~4 MB past the [2017,1024] table -> the BIF0 page fault that wedged the GPU.
-// The adds (W.x) and the mask embedding stay fp32; the gathered bf16 value is widened to fp32.
+// the adds staging for a pass: per codebook row, the revealed code's embedding (the 12 codebook
+// tables as ONE contiguous [12, 2017, 1024] bf16 upload, tts_heads12's shared weight; the
+// per-slot 12 bindings existed only for the per-slot head loop) or the mask embedding. One
+// thread per (c, hidden). The codebook embedding is a bf16 checkpoint tensor -- read it as
+// bfloat (2 B/elt) to match its layout; a `device float*` read doubled the byte index and ran
+// ~4 MB past the table -> the BIF0 page fault that wedged the GPU (f0020f7f). The adds (W.x)
+// and the mask embedding stay fp32; the gathered bf16 value is widened to fp32.
 [[kernel]] void tts_fill_adds(device float* adds [[buffer(0)]],
-                              const device bfloat* emb0 [[buffer(1)]],  const device bfloat* emb1 [[buffer(2)]],
-                              const device bfloat* emb2 [[buffer(3)]],  const device bfloat* emb3 [[buffer(4)]],
-                              const device bfloat* emb4 [[buffer(5)]],  const device bfloat* emb5 [[buffer(6)]],
-                              const device bfloat* emb6 [[buffer(7)]],  const device bfloat* emb7 [[buffer(8)]],
-                              const device bfloat* emb8 [[buffer(9)]],  const device bfloat* emb9 [[buffer(10)]],
-                              const device bfloat* emb10 [[buffer(11)]], const device bfloat* emb11 [[buffer(12)]],
-                              const device float* mask [[buffer(13)]],
-                              const device int* codes [[buffer(14)]],  const device uchar* revealed [[buffer(15)]],
+                              const device bfloat* emb_all [[buffer(1)]],
+                              const device float* mask [[buffer(2)]],
+                              const device int* codes [[buffer(3)]],  const device uchar* revealed [[buffer(4)]],
                               uint id [[thread_position_in_grid]]) {
   if (id >= 12u * 1024u) return;
   const uint c = id / 1024u, h = id % 1024u;
   if (!revealed[c]) { adds[id] = mask[h]; return; }
-  const int k = codes[c];
-  const device bfloat* e;
-  switch (c) {
-    case 0: e = emb0; break; case 1: e = emb1; break; case 2: e = emb2; break; case 3: e = emb3; break;
-    case 4: e = emb4; break; case 5: e = emb5; break; case 6: e = emb6; break; case 7: e = emb7; break;
-    case 8: e = emb8; break; case 9: e = emb9; break; case 10: e = emb10; break; default: e = emb11; break;
-  }
-  adds[id] = float(e[size_t(k) * 1024u + h]);
+  const int k = codes[c];  // the reveal wrote it: 0 <= k < 2017
+  adds[id] = float(emb_all[(size_t(c) * 2017u + size_t(k)) * 1024u + h]);
 }
 
 // the pass's reveal: for each codebook the host marked selected this pass (the MaskGIT schedule

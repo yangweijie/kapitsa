@@ -368,18 +368,26 @@ void DepthDecoder::load_gpu() {
   f32_upload(W.depth_b, depth_b_);
   f32_upload(W.mask_emb, mask_embedding_);
   f32_upload(W.final_norm, final_norm_);
+  // The 12 codebook embeddings as ONE contiguous [12, 2017, 1024] bf16 upload: tts_heads12 (the
+  // 12 slot GEMVs, one dispatch) and tts_fill_adds (the reveal's gather, one binding) share it.
+  // The per-slot 4 MB buffers existed only for the per-slot head/rms loops. The bf16 narrowing is
+  // bf16_upload's RNE truncation, byte-identical value to value (the same fp32 checkpoint input).
+  const size_t kEmbRow = size_t(kCodebookSize) * kHidden;
+  W.emb_all = Gpu::get().alloc(size_t(kCodebooks) * kEmbRow * 2 + 16, "tts_emb_all");
+  auto* ha = W.emb_all.as<uint16_t>();
   for (int c = 0; c < kCodebooks; ++c) {
-    // bf16: W.emb[c] is the codebook's [2017,1024] embedding tensor, a bf16 checkpoint value, and it
-    // is bound TWO ways -- tts_gemv reads it as the slot's tied head weight, and tts_fill_adds reads
-    // it as the reveal's embedding gather. Both must match its 2-byte (bfloat) layout; tts_fill_adds
-    // used to read it as a `device float*`, doubling the byte index and running ~4 MB past the table
-    // -> the BIF0 page fault that wedged the GPU (masked as zeroes by the MTL validation layer, so
-    // "all green under the layers" was a FALSE pass; the production JIT faults). Uploading it fp32
-    // to match one reader would mis-type the other (tts_gemv's bfloat read), so the bf16 upload is
-    // the faithful one -- and tts_fill_adds now widens its gathered bfloat to fp32 for the adds.
-    bf16_upload(W.emb[c], codebooks_[size_t(c)].embedding);
-    f32_upload(W.emb_norm[c], codebooks_[size_t(c)].norm);
+    const std::vector<float>& em = codebooks_[size_t(c)].embedding;
+    for (size_t i = 0; i < em.size(); ++i) {
+      uint32_t u;
+      memcpy(&u, &em[i], 4);
+      ha[size_t(c) * kEmbRow + i] = uint16_t((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+    }
   }
+  // the 12 slot norms as ONE [12, 1024] fp32 (tts_rms12's per-row gain, one dispatch)
+  W.emb_norm_all = Gpu::get().alloc(size_t(kCodebooks) * kHidden * 4 + 16, "tts_emb_norm_all");
+  auto* na = reinterpret_cast<float*>(W.emb_norm_all.ptr());
+  for (int c = 0; c < kCodebooks; ++c)
+    memcpy(na + size_t(c) * kHidden, codebooks_[size_t(c)].norm.data(), size_t(kHidden) * 4);
   for (int l = 0; l < kLayers; ++l) {
     const Layer& L = layers_[size_t(l)];
     GpuW::LG& G = W.L[size_t(l)];
@@ -524,10 +532,10 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
   auto fill_adds_gpu = [&] {
     e->use(Gpu::get().pipeline("tts_fill_adds"));
     e->buf(0, W.x);
-    for (int c = 0; c < kCodebooks; ++c) e->buf(1 + c, W.emb[size_t(c)]);
-    e->buf(13, W.mask_emb);
-    e->buf(14, cbuf);
-    e->buf(15, rbuf);
+    e->buf(1, W.emb_all);
+    e->buf(2, W.mask_emb);
+    e->buf(3, cbuf);
+    e->buf(4, rbuf);
     e->dispatch((kCodebooks * kHidden + 255) / 256, 1, 1, 256);
   };
   auto reveal = [&] {
@@ -588,27 +596,26 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       gemv_rows(W.tmp, G.w2, W.gi, W.zero, kHidden, kFfn);
       add12(W.x, W.tmp);
     }
-    // the heads: the final norm, then EACH slot's own embedding_norm (in place), then the
-    // 12 tied [2017, 1024] gemvs. The CPU oracle does both norms.
+    // the heads: the final norm (the trunk's final_norm over W.x into W.xn), then EACH slot's
+    // own embedding norm in one dispatch (tts_rms12: group c is slot c's row, the per-row gain
+    // from the contiguous [12, 1024] emb_norm upload; the CPU oracle does both norms), then the
+    // 12 tied [2017, 1024] head GEMVs in one dispatch (tts_heads12)
     rms12(W.xn, W.x, W.final_norm);
-    for (int c = 0; c < kCodebooks; ++c) {
-      const float eps = 1e-5f;
-      e->use(Gpu::get().pipeline("tts_rms"));
-      e->buf(0, W.xn, size_t(c) * kHidden * 4);
-      e->buf(1, W.emb_norm[size_t(c)]);
-      e->buf(2, W.tmp, size_t(c) * kHidden * 4);
-      e->val(3, eps);
-      e->dispatch(1, 1, 1, 128);
-    }
-    for (int c = 0; c < kCodebooks; ++c) {
+    e->use(Gpu::get().pipeline("tts_rms12"));
+    e->buf(0, W.xn);
+    e->buf(1, W.emb_norm_all);
+    e->buf(2, W.tmp);
+    e->val(3, 1e-5f);
+    e->dispatch(kCodebooks, 1, 1, 128);
+    {
       const Dims dims{kCodebookSize, kHidden};
-      e->use(Gpu::get().pipeline("tts_gemv"));
-      e->buf(0, W.emb[size_t(c)]);
-      e->buf(1, W.tmp, size_t(c) * kHidden * 4);
+      e->use(Gpu::get().pipeline("tts_heads12"));
+      e->buf(0, W.emb_all);
+      e->buf(1, W.tmp);
       e->buf(2, W.zero);
-      e->buf(3, W.logits, size_t(c) * kCodebookSize * 4);
+      e->buf(3, W.logits);
       e->val(4, dims);
-      e->dispatch((kCodebookSize + 63) / 64, 1, 1, 64);  // 2017 rows, guarded tail
+      e->dispatch((size_t(kCodebookSize) * kCodebooks + 63) / 64, 1, 1, 64);
     }
     if (rep_penalty != 1.0f && !rep_hist.empty()) {
       e->use(Gpu::get().pipeline("tts_pen_logits"));

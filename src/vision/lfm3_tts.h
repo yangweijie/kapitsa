@@ -83,7 +83,7 @@ class DepthDecoder {
   // the GPU side (lazy; the weights' fp32 host copies become bf16 device buffers once)
   struct GpuW {
     Buffer depth_w, depth_b, mask_emb, final_norm;
-    Buffer emb[12], emb_norm[12];
+    Buffer emb_all, emb_norm_all;  // the 12 codebooks' [2017,1024] bf16 + [1024] norms, contiguous
     struct LG {
       Buffer q, k, v, o, gate, qn, kn, op_norm, ffn_norm, w1, w2, w3;
     } L[3];
