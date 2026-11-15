@@ -12,6 +12,7 @@
 // its tied Embedding. Weights: bf16 in the Omni checkpoint (NOT in the GGUF — the import brings
 // them from the side checkpoint), converted to fp32 at load.
 #pragma once
+#include "metal/gpu.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -38,6 +39,14 @@ class DepthDecoder {
   // are exactly the all-masked argmax of codebooks 0-3).
   std::vector<int> sample_frame(const std::vector<float>& hidden, float temperature,
                                 const std::vector<int>& order) const;
+  // The GPU form (Metal kernels, src/kernels/tts.metal; the CPU forward stays the oracle). The
+  // weights ride to the device once (load_gpu); each call is one frame's three MaskGIT passes.
+  // The caller holds the GPU turn. F must be 1 (the decode shape).
+  bool gpu_ready() const { return gpu_ready_; }
+  void load_gpu();
+  std::vector<int> sample_frame_gpu(const std::vector<float>& hidden, float temperature, uint64_t seed);
+  std::vector<int> sample_frame_gpu(const std::vector<float>& hidden, float temperature,
+                                    const std::vector<int>& order);
 
  private:
   struct Layer {
@@ -50,6 +59,23 @@ class DepthDecoder {
   std::vector<float> depth_w_, depth_b_, mask_embedding_, final_norm_;
   std::vector<Codebook> codebooks_;
   std::vector<Layer> layers_;
+  // the GPU side (lazy; the weights' fp32 host copies become bf16 device buffers once)
+  struct GpuW {
+    Buffer depth_w, depth_b, mask_emb, final_norm;
+    Buffer emb[12], emb_norm[12];
+    struct LG {
+      Buffer q, k, v, o, gate, qn, kn, op_norm, ffn_norm, w1, w2, w3;
+    } L[3];
+    Buffer x, xn, q, k, v, att, gated, proj, tmp, gi, ui, logits;
+    Buffer zero;  // a zero pad: tts_gemv's optional bias binds this (the engine rejects null buffers)
+  };
+  std::unique_ptr<GpuW> gw_;
+  bool gpu_ready_ = false;
+  void bf16_upload(Buffer& dst, const std::vector<float>& src) const;  // the fp32 host copy as bf16
+
+ public:
+  // test hook: the depth_linear weights (the GPU-path checks' first link)
+  const std::vector<float>& debug_depth_w() const { return depth_w_; }
 };
 
 }  // namespace ni::tts

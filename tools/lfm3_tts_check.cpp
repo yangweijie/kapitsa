@@ -3,6 +3,7 @@
 // checkpoint is the Omni one (bf16, converted at load — the oracle upcasts the same way).
 //   lfm3_tts_check oracle CHECKPOINT_DIR ORACLE_DIR
 #include "vision/lfm3_tts.h"
+#include "metal/gpu.h"
 
 #include <nlohmann/json.hpp>
 #include <vector>
@@ -22,6 +23,8 @@ json parse(const std::string& p) {
   return nlohmann::json::parse(s);
 }
 }  // namespace
+
+struct Dims2 { uint32_t x, y; };
 
 int main(int argc, char** argv) {
   // bare (the metric's runner): the repo's own checkpoint and oracle; "dir MODEL_DIR" loads the

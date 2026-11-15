@@ -3,6 +3,8 @@
 // tiny per frame (12 slots x 1024, 3 layers) — CPU matmuls are far under the 12.5 fps budget.
 #include "vision/lfm3_tts.h"
 
+#include "util/log.h"
+
 #include <algorithm>
 #include <random>
 #include <cmath>
@@ -293,4 +295,304 @@ std::vector<int> DepthDecoder::sample_frame(const std::vector<float>& hidden, fl
   return codes;
 }
 
+
+namespace {
+struct Dims { uint32_t x, y; };
+}  // namespace
+
+// ---- the GPU path (src/kernels/tts.metal; the CPU forward above is the oracle) ----
+
+// The fp32 host copy as bf16 into a device buffer (the checkpoint's weights are bf16; the load
+// widened them, this narrows them back — the band is the checkpoint's own).
+void DepthDecoder::bf16_upload(Buffer& dst, const std::vector<float>& src) const {
+  dst = Gpu::get().alloc(src.size() * 2 + 16, "tts_w");
+  auto* h = dst.as<uint16_t>();
+  for (size_t i = 0; i < src.size(); ++i) {
+    uint32_t u;
+    memcpy(&u, &src[i], 4);
+    h[i] = uint16_t((u + 0x7FFFu + ((u >> 16) & 1)) >> 16);
+  }
+}
+
+void DepthDecoder::load_gpu() {
+  if (gpu_ready_) return;
+  gw_ = std::make_unique<GpuW>();
+  GpuW& W = *gw_;
+  bf16_upload(W.depth_w, depth_w_);
+  // the biases and the norms stay fp32: the kernels read them as `const device float*`
+  auto f32_upload = [](Buffer& dst, const std::vector<float>& src) {
+    dst = Gpu::get().alloc(src.size() * 4 + 16, "tts_f32_w");
+    memcpy(dst.ptr(), src.data(), src.size() * 4);
+  };
+  f32_upload(W.depth_b, depth_b_);
+  f32_upload(W.mask_emb, mask_embedding_);
+  f32_upload(W.final_norm, final_norm_);
+  for (int c = 0; c < kCodebooks; ++c) {
+    bf16_upload(W.emb[c], codebooks_[size_t(c)].embedding);
+    f32_upload(W.emb_norm[c], codebooks_[size_t(c)].norm);
+  }
+  for (int l = 0; l < kLayers; ++l) {
+    const Layer& L = layers_[size_t(l)];
+    GpuW::LG& G = W.L[size_t(l)];
+    bf16_upload(G.q, L.q_w);
+    bf16_upload(G.k, L.k_w);
+    bf16_upload(G.v, L.v_w);
+    bf16_upload(G.o, L.o_w);
+    bf16_upload(G.gate, L.gate_w);
+    bf16_upload(G.w1, L.w1);
+    bf16_upload(G.w2, L.w2);
+    bf16_upload(G.w3, L.w3);
+    G.qn = Gpu::get().alloc(L.qn.size() * 4 + 16, "tts_w");
+    memcpy(G.qn.ptr(), L.qn.data(), L.qn.size() * 4);
+    G.kn = Gpu::get().alloc(L.kn.size() * 4 + 16, "tts_w");
+    memcpy(G.kn.ptr(), L.kn.data(), L.kn.size() * 4);
+    G.op_norm = Gpu::get().alloc(L.op_norm.size() * 4 + 16, "tts_w");
+    memcpy(G.op_norm.ptr(), L.op_norm.data(), L.op_norm.size() * 4);
+    G.ffn_norm = Gpu::get().alloc(L.ffn_norm.size() * 4 + 16, "tts_w");
+    memcpy(G.ffn_norm.ptr(), L.ffn_norm.data(), L.ffn_norm.size() * 4);
+  }
+  // the scratch: the slot state, the projections and the logits (fp32, F = 1)
+  const size_t H = size_t(kCodebooks) * kHidden;
+  W.x = Gpu::get().alloc(H * 4 + 16, "tts_x");
+  W.xn = Gpu::get().alloc(H * 4 + 16, "tts_xn");
+  W.q = Gpu::get().alloc(H * 4 + 16, "tts_q");
+  W.k = Gpu::get().alloc(size_t(kCodebooks) * kKvHeads * kHeadDim * 4 + 16, "tts_k");
+  W.v = Gpu::get().alloc(size_t(kCodebooks) * kKvHeads * kHeadDim * 4 + 16, "tts_v");
+  W.gated = Gpu::get().alloc(size_t(kCodebooks) * kHeads * 4 + 16, "tts_gated");
+  W.att = Gpu::get().alloc(H * 4 + 16, "tts_att");
+  W.tmp = Gpu::get().alloc(H * 4 + 16, "tts_tmp");
+  W.proj = Gpu::get().alloc(kCodebooks * kHidden * 4 + 16, "tts_proj");
+  W.gi = Gpu::get().alloc(size_t(kCodebooks) * kFfn * 4 + 16, "tts_gi");
+  W.ui = Gpu::get().alloc(size_t(kCodebooks) * kFfn * 4 + 16, "tts_ui");
+  W.logits = Gpu::get().alloc(size_t(kCodebooks) * kCodebookSize * 4 + 16, "tts_logits");
+  W.zero = Gpu::get().alloc(64, "tts_zero");
+  memset(W.zero.ptr(), 0, 64);
+  gpu_ready_ = true;
+}
+
+
+std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden, float temperature,
+                                                uint64_t seed) {
+  std::vector<int> order(kCodebooks);
+  for (int i = 0; i < kCodebooks; ++i) order[size_t(i)] = i;
+  std::mt19937 shuf(seed);
+  std::shuffle(order.begin(), order.end(), shuf);
+  return sample_frame_gpu(hidden, temperature, order);
+}
+
+std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden, float temperature,
+                                                const std::vector<int>& order) {
+  if (!gpu_ready_) load_gpu();
+  if (hidden.size() != size_t(kTextHidden)) die("the hidden must be one frame's 2048 values");
+  GpuW& W = *gw_;
+  auto e = Gpu::get().begin();
+  // 1. the slots: depth_linear (one gemv, 12288 rows), then the mask/code embeddings per slot
+  {
+    const Dims dims{kCodebooks * kHidden, kTextHidden};
+    const Buffer hid = Gpu::get().alloc(kTextHidden * 4 + 16, "tts_hidden");
+    memcpy(hid.ptr(), hidden.data(), kTextHidden * 4);
+    e->use(Gpu::get().pipeline("tts_gemv"));
+    e->buf(0, W.depth_w);
+    e->buf(1, hid);
+    e->buf(2, W.depth_b);
+    e->buf(3, W.proj);
+    e->val(4, dims);
+    e->dispatch(kCodebooks * kHidden, 1, 1, 64);
+    e->commit_and_wait();
+    e = Gpu::get().begin();
+  }
+  // the slot adds (masked: the mask_embedding; revealed: the code's embedding), an element kernel
+  // (no dedicated kernel: each slot's row add runs as tts_add over the code/mask embedding pointer
+  //  selected on the host — 12 host-side selections, 12 small dispatches through one encoder)
+  std::vector<int> codes(kCodebooks, 0);
+  std::vector<uint8_t> revealed(kCodebooks, 0);
+  static const int kSchedule[] = {4, 4, 4};
+
+  // the trunk's weights are ONE shared [out, in] matrix applied to each of the 12 slots:
+  // tts_gemv12's grid is (out, 12), one thread per (output row, slot)
+  auto gemv_rows = [&](Buffer& y, const Buffer& w, const Buffer& x, const Buffer& b, uint out, uint in) {
+    const Dims dims{out, in};
+    e->use(Gpu::get().pipeline("tts_gemv12"));
+    e->buf(0, w);
+    e->buf(1, x);
+    e->buf(2, b);
+    e->buf(3, y);
+    e->val(4, dims);
+    e->dispatch((out * kCodebooks + 63) / 64, 1, 1, 64);
+  };
+  auto rms12 = [&](Buffer& y, const Buffer& x, const Buffer& w) {
+    e->use(Gpu::get().pipeline("tts_rms"));
+    e->buf(0, x);
+    e->buf(1, w);
+    e->buf(2, y);
+    const float eps = 1e-5f;
+    e->val(3, eps);
+    e->dispatch(kCodebooks, 1, 1, 128);
+  };
+  auto add12 = [&](Buffer& y, const Buffer& x) {
+    e->use(Gpu::get().pipeline("tts_add"));
+    e->buf(0, y);
+    e->buf(1, x);
+    e->dispatch(kCodebooks * kHidden, 1, 1, 256);
+  };
+
+  // the mask/code embeddings: gathered on the host into one [12, 1024] fp32 staging (12 rows of
+  // either the mask embedding or one code's embedding) and added once
+  const Buffer adds = Gpu::get().alloc(size_t(kCodebooks) * kHidden * 4 + 16, "tts_adds");
+  auto fill_adds = [&] {
+    auto* h = adds.as<float>();
+    for (int c = 0; c < kCodebooks; ++c) {
+      const float* src = revealed[size_t(c)] ? codebooks_[size_t(c)].embedding.data() +
+                                                       size_t(codes[size_t(c)]) * kHidden
+                                             : mask_embedding_.data();
+      memcpy(h + size_t(c) * kHidden, src, size_t(kHidden) * 4);
+    }
+  };
+
+  int pick = 0;
+  std::vector<float> logits_host(size_t(kCodebooks) * kCodebookSize);
+  std::vector<float> cpu_logits;
+  if (getenv("TTS_DBG")) {
+    cpu_logits.resize(size_t(kCodebooks) * kCodebookSize);
+    forward(hidden, std::vector<int>(kCodebooks, 0), std::vector<uint8_t>(kCodebooks, 1), cpu_logits);
+  }
+  for (int pass = 0; pass < 3; ++pass) {
+    std::vector<uint8_t> masked(kCodebooks);
+    for (int i = 0; i < kCodebooks; ++i) masked[size_t(i)] = !revealed[size_t(i)];
+    fill_adds();
+    memcpy(adds.ptr(), adds.ptr(), 0);  // (the staging was written on the host; the copy is done)
+    // x = proj + adds
+    memcpy(W.x.ptr(), adds.ptr(), size_t(kCodebooks) * kHidden * 4);
+    add12(W.x, W.proj);
+    e->commit_and_wait();
+    e = Gpu::get().begin();
+
+    // the trunk: 3 layers
+    for (int l = 0; l < kLayers; ++l) {
+      const GpuW::LG& G = W.L[size_t(l)];
+      rms12(W.xn, W.x, G.op_norm);
+      gemv_rows(W.q, G.q, W.xn, W.zero, kCodebooks * kHidden, kHidden);
+      gemv_rows(W.k, G.k, W.xn, W.zero, kCodebooks * kKvHeads * kHeadDim, kHidden);
+      gemv_rows(W.v, G.v, W.xn, W.zero, kCodebooks * kKvHeads * kHeadDim, kHidden);
+      gemv_rows(W.gated, G.gate, W.xn, W.zero, kCodebooks * kHeads, kHidden);
+      e->commit_and_wait();
+    e = Gpu::get().begin();
+      // the q/k rope + the q/k norms (32+8 heads per slot, one thread per head)
+      // two separate encoder segments: val() writes the argument buffer the NEXT dispatch
+      // reads, so a second val() before the first dispatch would clobber q's is_k
+      for (uint is_k = 0; is_k < 2; ++is_k) {
+        e->use(Gpu::get().pipeline("tts_rope_qk"));
+        e->buf(0, W.q);
+        e->buf(1, W.k);
+        e->buf(2, G.qn);
+        e->buf(3, G.kn);
+        e->val(4, is_k);
+        e->dispatch(is_k ? kCodebooks * kKvHeads : kCodebooks * kHeads, 1, 1, 64);
+        e->commit_and_wait();
+        e = Gpu::get().begin();
+      }
+      // the attention (12 threads in one group) then the o_proj + the residual
+      e->use(Gpu::get().pipeline("tts_attn12"));
+      e->buf(0, W.q);
+      e->buf(1, W.k);
+      e->buf(2, W.v);
+      e->buf(3, W.gated);
+      e->buf(4, W.att);
+      e->dispatch(1, 1, 1, 12);
+      e->commit_and_wait();
+    e = Gpu::get().begin();
+      gemv_rows(W.tmp, G.o, W.att, W.zero, kCodebooks * kHidden, kHidden);
+      add12(W.x, W.tmp);
+      // the FFN half
+      rms12(W.xn, W.x, G.ffn_norm);
+      gemv_rows(W.gi, G.w1, W.xn, W.zero, kCodebooks * kFfn, kHidden);
+      gemv_rows(W.ui, G.w3, W.xn, W.zero, kCodebooks * kFfn, kHidden);
+      e->use(Gpu::get().pipeline("tts_silu"));
+      e->buf(0, W.gi);
+      e->buf(1, W.ui);
+      e->dispatch(kCodebooks * kFfn, 1, 1, 256);
+      gemv_rows(W.tmp, G.w2, W.gi, W.zero, kCodebooks * kHidden, kFfn);
+      add12(W.x, W.tmp);
+      e->commit_and_wait();
+    e = Gpu::get().begin();
+    }
+    // the heads: the final norm, then EACH slot's own embedding_norm (in place), then the
+    // 12 tied [2017, 1024] gemvs. The CPU oracle does both norms — one final_norm over all
+    // slots, then a per-codebook RMSNorm before its head.
+    rms12(W.xn, W.x, W.final_norm);
+    e->commit_and_wait();
+    e = Gpu::get().begin();
+    for (int c = 0; c < kCodebooks; ++c) {
+      const float eps = 1e-5f;
+      e->use(Gpu::get().pipeline("tts_rms"));
+      e->buf(0, W.xn, size_t(c) * kHidden * 4);
+      e->buf(1, W.emb_norm[size_t(c)]);
+      e->buf(2, W.tmp, size_t(c) * kHidden * 4);
+      e->val(3, eps);
+      e->dispatch(1, 1, 1, 128);
+    }
+    e->commit_and_wait();
+    e = Gpu::get().begin();
+    for (int c = 0; c < kCodebooks; ++c) {
+      const Dims dims{kCodebookSize, kHidden};
+      e->use(Gpu::get().pipeline("tts_gemv"));
+      e->buf(0, W.emb[size_t(c)]);
+      e->buf(1, W.tmp, size_t(c) * kHidden * 4);
+      e->buf(2, W.zero);
+      e->buf(3, W.logits, size_t(c) * kCodebookSize * 4);
+      e->val(4, dims);
+      e->dispatch(kCodebookSize, 1, 1, 64);
+    }
+    e->commit_and_wait();
+    e = Gpu::get().begin();
+    memcpy(logits_host.data(), W.logits.ptr(), logits_host.size() * 4);
+    if (getenv("TTS_DBG") && pass == 0) {
+      double dot = 0, da = 0, db = 0, mx = 0;
+      for (size_t i = 0; i < logits_host.size(); ++i) {
+        const double d = double(logits_host[i]) - double(cpu_logits[i]);
+        dot += d * d; da += double(logits_host[i]) * double(logits_host[i]);
+        db += double(cpu_logits[i]) * double(cpu_logits[i]);
+        mx = std::max(mx, std::abs(d));
+      }
+      const double cosv = (da * db) == 0 ? 0.0 : (da + db - dot) / (2.0 * std::sqrt(da * db));
+      logi("tts dbg: pass0 logits cosine %.6f max|d| %.4f gpu[0..3] %.3f %.3f %.3f cpu %.3f %.3f %.3f",
+           cosv, mx, logits_host[0], logits_host[1], logits_host[2], cpu_logits[0], cpu_logits[1], cpu_logits[2]);
+    }
+
+    // the reveal (the CPU sampler's tail, unchanged)
+    for (int j = 0; j < kSchedule[pass]; ++j) {
+      const int c = order[size_t(pick++)];
+      if (temperature <= 0) {
+        int best = 0;
+        float bv = -1e30f;
+        const float* lg = logits_host.data() + size_t(c) * kCodebookSize;
+        for (int k = 0; k < kCodebookSize; ++k)
+          if (lg[k] > bv) bv = lg[k], best = k;
+        codes[size_t(c)] = best;
+      } else {
+        std::vector<double> p(kCodebookSize);
+        double mx = -1e300, sum = 0;
+        const float* lg = logits_host.data() + size_t(c) * kCodebookSize;
+        for (int k = 0; k < kCodebookSize; ++k) mx = std::max(mx, double(lg[k] / temperature));
+        for (int k = 0; k < kCodebookSize; ++k) sum += p[size_t(k)] = std::exp(double(lg[k] / temperature) - mx);
+        std::uniform_real_distribution<double> uni(0.0, sum);
+        std::mt19937 rng(0);  // the CPU sampler's fixed stream (the same draws)
+        double draw = uni(rng), run = 0;
+        int sel = kCodebookSize - 1;
+        for (int k = 0; k < kCodebookSize; ++k) {
+          run += p[size_t(k)];
+          if (draw <= run) {
+            sel = k;
+            break;
+          }
+        }
+        codes[size_t(c)] = sel;
+      }
+      revealed[size_t(c)] = 1;
+    }
+  }
+  return codes;
+}
+
 }  // namespace ni::tts
+
