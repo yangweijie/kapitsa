@@ -481,10 +481,14 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
     const char* s = getenv("NI_TTS_TILE");
     return s ? *s != '0' : true;
   }();
-  auto gemv_rows = [&](Buffer& y, const Buffer& w, const Buffer& x, const Buffer& b, uint out, uint in) {
+  // residual: y ACCUMULATES the dot (the _r kernels, the add12 fold: the caller's residual-add
+  // dispatch is gone; y is the running state, not read by the products, so the += is race-free)
+  auto gemv_rows = [&](Buffer& y, const Buffer& w, const Buffer& x, const Buffer& b, uint out, uint in,
+                       bool residual = false) {
     const Dims dims{out, in};
     // both kernels take the same (w, x, b, y, dims) layout; only the dispatch grain differs
-    e->use(kTile ? Gpu::get().pipeline("tts_gemv12_t") : Gpu::get().pipeline("tts_gemv12"));
+    e->use(kTile ? Gpu::get().pipeline(residual ? "tts_gemv12_t_r" : "tts_gemv12_t")
+                 : Gpu::get().pipeline(residual ? "tts_gemv12_r" : "tts_gemv12"));
     e->buf(0, w);
     e->buf(1, x);
     e->buf(2, b);
@@ -503,15 +507,6 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
     const float eps = 1e-5f;
     e->val(3, eps);
     e->dispatch(kCodebooks, 1, 1, 128);
-  };
-  auto add12 = [&](Buffer& y, const Buffer& x) {
-    e->use(Gpu::get().pipeline("tts_add"));
-    e->buf(0, y);
-    e->buf(1, x);
-    // the dispatch arg is the group COUNT (dispatchThreadgroups), not the thread count: kHidden
-    // elements over a 256-wide threadgroup is ceil(.../256) groups (the old kHidden-groups form
-    // launched 256x the threads, an OOB read/write on the unguarded element kernel).
-    e->dispatch((kCodebooks * kHidden + 255) / 256, 1, 1, 256);
   };
 
   // ---- the MaskGIT reveal on the GPU (one readout per frame; the CPU sampler is the oracle) ----
@@ -536,6 +531,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
     e->buf(2, W.mask_emb);
     e->buf(3, cbuf);
     e->buf(4, rbuf);
+    e->buf(5, W.proj);  // the depth GEMV's rows, folded into the adds (the slot-init add12 is gone)
     e->dispatch((kCodebooks * kHidden + 255) / 256, 1, 1, 256);
   };
   auto reveal = [&] {
@@ -556,8 +552,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
   for (int pass = 0; pass < 3; ++pass) {
     sel.assign(kCodebooks, 0);
     for (int j = 0; j < kSchedule[pass]; ++j) sel[size_t(order[size_t(pick++)])] = 1;
-    fill_adds_gpu();
-    add12(W.x, W.proj);
+    fill_adds_gpu();  // the adds fold in the depth GEMV's rows (the slot-init add12 is gone)
     // the trunk: 3 layers
     for (int l = 0; l < kLayers; ++l) {
       const GpuW::LG& G = W.L[size_t(l)];
@@ -583,8 +578,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->buf(3, W.gated);
       e->buf(4, W.att);
       e->dispatch(1, 1, 1, 12);
-      gemv_rows(W.tmp, G.o, W.att, W.zero, kHidden, kHidden);
-      add12(W.x, W.tmp);
+      gemv_rows(W.x, G.o, W.att, W.zero, kHidden, kHidden, true);  // residual: the add12 fold
       // the FFN half
       rms12(W.xn, W.x, G.ffn_norm);
       gemv_rows(W.gi, G.w1, W.xn, W.zero, kFfn, kHidden);
@@ -593,8 +587,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->buf(0, W.gi);
       e->buf(1, W.ui);
       e->dispatch((kCodebooks * kFfn + 255) / 256, 1, 1, 256);  // group count, not thread count
-      gemv_rows(W.tmp, G.w2, W.gi, W.zero, kHidden, kFfn);
-      add12(W.x, W.tmp);
+      gemv_rows(W.x, G.w2, W.gi, W.zero, kHidden, kFfn, true);  // residual: the add12 fold
     }
     // the heads: the final norm (the trunk's final_norm over W.x into W.xn), then EACH slot's
     // own embedding norm in one dispatch (tts_rms12: group c is slot c's row, the per-row gain

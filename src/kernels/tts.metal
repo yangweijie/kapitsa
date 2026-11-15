@@ -110,12 +110,6 @@ using namespace metal;
   gi[i] = v / (1.0f + metal::exp(-v)) * ui[i];
 }
 
-// y += x, element-wise (the residuals).
-[[kernel]] void tts_add(device float* y [[buffer(0)]], const device float* x [[buffer(1)]],
-                        uint i [[thread_position_in_grid]]) {
-  y[i] += x[i];
-}
-
 
 // The trunk's projections: ONE shared [out, in] weight matrix applied to each of the 12 slots
 // independently (the CPU oracle's per-slot matvec loop). grid = (out, 12), one thread per (row, slot).
@@ -187,6 +181,71 @@ using namespace metal;
   }
 }
 
+// tts_gemv12's residual form (the add12 fold): y[c, o] ACCUMULATES the dot, so the GEMV's
+// dispatch doubles as its own residual add (the caller's add12 is gone). y (the running state)
+// is written once per (o, c) thread and NOT read by the products, so the += is race-free.
+[[kernel]] void tts_gemv12_r(const device bfloat* w [[buffer(0)]], const device float* x [[buffer(1)]],
+                            const device float* b [[buffer(2)]], device float* y [[buffer(3)]],
+                            constant uint2& dims [[buffer(4)]],   // (out, in)
+                            uint tid [[thread_position_in_grid]]) {
+  const uint total = dims.x * 12u;
+  if (tid >= total) return;
+  const uint o = tid % dims.x, c = tid / dims.x;
+  const device bfloat* row = w + size_t(o) * dims.y;
+  const device float* xc = x + size_t(c) * dims.y;
+  float acc = 0;
+  for (uint i = 0; i < dims.y; ++i) acc += float(row[i]) * xc[i];
+  y[size_t(c) * dims.x + o] += acc + (b ? b[o] : 0.f);
+}
+
+// tts_gemv12_t's residual form: the tile's final store accumulates into y (the running state).
+// Same grain, guards and tmem as tts_gemv12_t; only the store is the +=.
+[[kernel]] void tts_gemv12_t_r(const device bfloat* w [[buffer(0)]], const device float* x [[buffer(1)]],
+                               const device float* b [[buffer(2)]], device float* y [[buffer(3)]],
+                               constant uint2& dims [[buffer(4)]],
+                               uint g [[threadgroup_position_in_grid]],
+                               uint tid [[thread_position_in_threadgroup]]) {
+  const uint out = dims.x, in = dims.y;
+  const uint TM = 16, TK = 64, KL = 8;
+  const uint o0 = g * TM;
+  threadgroup bfloat wt[TM * TK];
+  threadgroup float xt[12 * TK];
+  threadgroup float rt[12 * TM * KL];
+  threadgroup float yt[12 * TM];
+  for (uint i = tid; i < 12u * TM; i += 128u) yt[i] = 0.f;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint oi = tid / KL, kl = tid % KL;
+  for (uint ck = 0; ck * TK < in; ++ck) {
+    const uint k0 = ck * TK;
+    for (uint i = tid; i < TM * TK; i += 128u) {
+      const uint o = o0 + i / TK, k = k0 + i % TK;
+      wt[i] = (o < out && k < in) ? w[size_t(o) * in + k] : bfloat(0);
+    }
+    for (uint i = tid; i < 12u * TK; i += 128u) {
+      const uint c = i / TK, k = k0 + i % TK;
+      xt[i] = (k < in) ? x[size_t(c) * in + k] : 0.f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = 0; c < 12; ++c) {
+      float s = 0;
+      for (uint j = 0; j < KL; ++j) s += float(wt[oi * TK + kl * KL + j]) * xt[c * TK + kl * KL + j];
+      rt[(size_t(c) * TM + oi) * KL + kl] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (kl == 0u)
+      for (uint c = 0; c < 12; ++c) {
+        float s = 0;
+        for (uint j = 0; j < KL; ++j) s += rt[(size_t(c) * TM + oi) * KL + j];
+        yt[c * TM + oi] += s;
+      }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint i = tid; i < 12u * TM; i += 128u) {
+    const uint c = i / TM, o = o0 + i % TM;
+    if (o < out) y[size_t(c) * out + o] += yt[i] + (b ? b[o] : 0.f);
+  }
+}
+
 // tts_rms's batched form for the 12 slots' OWN embedding norms (the per-slot loop's one
 // dispatch): group c is slot c's row of x/y ([12, 1024]); the per-row gain is w's row c
 // (the contiguous [12, 1024] emb_norm upload). Same math as tts_rms (the mean-square over
@@ -251,21 +310,26 @@ using namespace metal;
 
 // the adds staging for a pass: per codebook row, the revealed code's embedding (the 12 codebook
 // tables as ONE contiguous [12, 2017, 1024] bf16 upload, tts_heads12's shared weight; the
-// per-slot 12 bindings existed only for the per-slot head loop) or the mask embedding. One
-// thread per (c, hidden). The codebook embedding is a bf16 checkpoint tensor -- read it as
-// bfloat (2 B/elt) to match its layout; a `device float*` read doubled the byte index and ran
-// ~4 MB past the table -> the BIF0 page fault that wedged the GPU (f0020f7f). The adds (W.x)
-// and the mask embedding stay fp32; the gathered bf16 value is widened to fp32.
+// per-slot 12 bindings existed only for the per-slot head loop) or the mask embedding, THEN the
+// depth GEMV's row (proj: the slot-init add12's W.proj, folded in -- the pass's adds are
+// embedding + depth projection in one dispatch). One thread per (c, hidden). The codebook
+// embedding is a bf16 checkpoint tensor -- read it as bfloat (2 B/elt) to match its layout; a
+// `device float*` read doubled the byte index and ran ~4 MB past the table -> the BIF0 page
+// fault that wedged the GPU (f0020f7f). The adds (W.x), the mask and the proj stay fp32; the
+// gathered bf16 value is widened to fp32.
 [[kernel]] void tts_fill_adds(device float* adds [[buffer(0)]],
                               const device bfloat* emb_all [[buffer(1)]],
                               const device float* mask [[buffer(2)]],
                               const device int* codes [[buffer(3)]],  const device uchar* revealed [[buffer(4)]],
+                              const device float* proj [[buffer(5)]],
                               uint id [[thread_position_in_grid]]) {
   if (id >= 12u * 1024u) return;
   const uint c = id / 1024u, h = id % 1024u;
-  if (!revealed[c]) { adds[id] = mask[h]; return; }
-  const int k = codes[c];  // the reveal wrote it: 0 <= k < 2017
-  adds[id] = float(emb_all[(size_t(c) * 2017u + size_t(k)) * 1024u + h]);
+  const float base = revealed[c]
+                        // the reveal wrote codes[c]: 0 <= k < 2017
+                        ? float(emb_all[(size_t(c) * 2017u + size_t(codes[c])) * 1024u + h])
+                        : mask[h];
+  adds[id] = base + proj[id];
 }
 
 // the pass's reveal: for each codebook the host marked selected this pass (the MaskGIT schedule
