@@ -2824,7 +2824,11 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       const bool is_audio = k < mm.kinds.size() && mm.kinds[k] == vision::Media::audio;
       if (is_audio) {
         if (!audio_->loaded()) audio_->load();
-        audio_rows.push_back(audio_->encode(ra.clips[ka++]));
+        // the GPU path (src/kernels/audio.metal, one command buffer + a bounded readout): on by
+        // default for the class — every Mac with a GPU running an Omni model's audio input. It
+        // falls back to the CPU forward on its own (a config the kernels don't cover, a wedged
+        // readout), so the request is never lost to the tower.
+        audio_rows.push_back(audio_->encode_gpu(ra.clips[ka++]));
         runs.push_back(vision::EmbedRun{sp.pos, sp.n, audio_rows.back(), 0, audio_->out_dim()});
         continue;
       }

@@ -518,86 +518,97 @@ void Lfm3Audio::load_gpu() {
   gpu_ready_ = true;
 }
 
-std::vector<float> Lfm3Audio::dbg_downsample_gpu(const AudioPrepared& p) const {
-  Lfm3Audio* self = const_cast<Lfm3Audio*>(this);
-  if (!gpu_ready_) self->load_gpu();
-  const GpuWeights& G = *gw_;
+// the three dispatch sequences: the caller owns the encoder and the readback (the check path
+// commits + waits unbounded, the production encode_gpu() runs all three in ONE command buffer
+// with a bounded readout + the CPU fallback).
+void Lfm3Audio::ds_dispatches(Encoder& e, GpuWeights& G, const AudioPrepared& p, const Buffer& mel,
+                              Buffer& s1, Buffer& s2, Buffer& s2o, Buffer& s3, Buffer& s3o,
+                              Buffer& out) const {
   const int M = c_.mel_bins, C = c_.conv_channels, H = c_.hidden;
   const int t1 = (p.frames + 1) / 2, m1 = (M + 1) / 2;
   const int t2 = (t1 + 1) / 2, m2 = (m1 + 1) / 2;
   const int t3 = (t2 + 1) / 2, m3 = (m2 + 1) / 2;
   const size_t n1 = size_t(t1) * m1 * C, n2 = size_t(t2) * m2 * C, n3 = size_t(t3) * m3 * C;
-  Gpu& gpu = Gpu::get();
-  const Buffer mel = gpu.alloc(p.mel.size() * 4 + 16, "ad_mel");
-  memcpy(mel.ptr(), p.mel.data(), p.mel.size() * 4);
-  const Buffer s1 = gpu.alloc(n1 * 4 + 16, "ad_s1");
-  const Buffer s2 = gpu.alloc(n2 * 4 + 16, "ad_s2");
-  const Buffer s2o = gpu.alloc(n2 * 4 + 16, "ad_s2o");
-  const Buffer s3 = gpu.alloc(n3 * 4 + 16, "ad_s3");
-  const Buffer s3o = gpu.alloc(n3 * 4 + 16, "ad_s3o");
-  const Buffer outb = gpu.alloc(size_t(t3) * H * 4 + 16, "ad_out");
-  auto e = gpu.begin();
   {  // stage 1: conv_in over the raw mel (its 1x1 is the identity, the SiLU is fused)
     const Adims g{std::uint32_t(p.frames), std::uint32_t(M), std::uint32_t(C), std::uint32_t(t1)};
-    e->use(gpu.pipeline("audio_ds_conv"));
-    e->buf(0, mel);
-    e->buf(1, G.ci_w);
-    e->buf(2, G.ci_b);
-    e->buf(3, s1);
-    e->val(4, g);
-    e->dispatch((n1 + 255) / 256, 1, 1, 256);  // group count, not thread count
+    e.use(Gpu::get().pipeline("audio_ds_conv"));
+    e.buf(0, mel);
+    e.buf(1, G.ci_w);
+    e.buf(2, G.ci_b);
+    e.buf(3, s1);
+    e.val(4, g);
+    e.dispatch((n1 + 255) / 256, 1, 1, 256);  // group count, not thread count
   }
-  // the 1x1 mix needs a separate out buffer: each thread reads its whole row before writing
-  // one of its slots, so an in-place dispatch would race (the CPU stage keeps the conv and the
-  // mix apart for the same reason).
   {  // stage 2: conv_mid + lin_mid
     const Adims g{std::uint32_t(t1), std::uint32_t(m1), std::uint32_t(C), std::uint32_t(t2)};
-    e->use(gpu.pipeline("audio_ds_conv2"));
-    e->buf(0, s1);
-    e->buf(1, G.cm_w);
-    e->buf(2, G.cm_b);
-    e->buf(3, s2);
-    e->val(4, g);
-    e->dispatch((n2 + 255) / 256, 1, 1, 256);
+    e.use(Gpu::get().pipeline("audio_ds_conv2"));
+    e.buf(0, s1);
+    e.buf(1, G.cm_w);
+    e.buf(2, G.cm_b);
+    e.buf(3, s2);
+    e.val(4, g);
+    e.dispatch((n2 + 255) / 256, 1, 1, 256);
     const A2 dims{std::uint32_t(t2 * m2), std::uint32_t(C)};
-    e->use(gpu.pipeline("audio_ds_lin"));
-    e->buf(0, s2);
-    e->buf(1, G.lm_w);
-    e->buf(2, G.lm_b);
-    e->buf(3, s2o);
-    e->val(4, dims);
-    e->dispatch((n2 + 255) / 256, 1, 1, 256);
+    e.use(Gpu::get().pipeline("audio_ds_lin"));
+    e.buf(0, s2);
+    e.buf(1, G.lm_w);
+    e.buf(2, G.lm_b);
+    e.buf(3, s2o);
+    e.val(4, dims);
+    e.dispatch((n2 + 255) / 256, 1, 1, 256);
   }
   {  // stage 3: conv_end + lin_end
     const Adims g{std::uint32_t(t2), std::uint32_t(m2), std::uint32_t(C), std::uint32_t(t3)};
-    e->use(gpu.pipeline("audio_ds_conv2"));
-    e->buf(0, s2o);
-    e->buf(1, G.ce_w);
-    e->buf(2, G.ce_b);
-    e->buf(3, s3);
-    e->val(4, g);
-    e->dispatch((n3 + 255) / 256, 1, 1, 256);
+    e.use(Gpu::get().pipeline("audio_ds_conv2"));
+    e.buf(0, s2o);
+    e.buf(1, G.ce_w);
+    e.buf(2, G.ce_b);
+    e.buf(3, s3);
+    e.val(4, g);
+    e.dispatch((n3 + 255) / 256, 1, 1, 256);
     const A2 dims{std::uint32_t(t3 * m3), std::uint32_t(C)};
-    e->use(gpu.pipeline("audio_ds_lin"));
-    e->buf(0, s3);
-    e->buf(1, G.le_w);
-    e->buf(2, G.le_b);
-    e->buf(3, s3o);
-    e->val(4, dims);
-    e->dispatch((n3 + 255) / 256, 1, 1, 256);
+    e.use(Gpu::get().pipeline("audio_ds_lin"));
+    e.buf(0, s3);
+    e.buf(1, G.le_w);
+    e.buf(2, G.le_b);
+    e.buf(3, s3o);
+    e.val(4, dims);
+    e.dispatch((n3 + 255) / 256, 1, 1, 256);
   }
   {  // lin_out: each token's channel-major (mel, C) flatten GEMV'd to the hidden width
     const A2 dims{std::uint32_t(H), std::uint32_t(t3)};
     const A2 sh{std::uint32_t(m3), std::uint32_t(C)};
-    e->use(gpu.pipeline("audio_ds_out"));
-    e->buf(0, G.lo_w);
-    e->buf(1, s3o);
-    e->buf(2, G.lo_b);
-    e->buf(3, outb);
-    e->val(4, dims);
-    e->val(5, sh);
-    e->dispatch((size_t(t3) * H + 255) / 256, 1, 1, 256);
+    e.use(Gpu::get().pipeline("audio_ds_out"));
+    e.buf(0, G.lo_w);
+    e.buf(1, s3o);
+    e.buf(2, G.lo_b);
+    e.buf(3, out);
+    e.val(4, dims);
+    e.val(5, sh);
+    e.dispatch((size_t(t3) * H + 255) / 256, 1, 1, 256);
   }
+}
+
+std::vector<float> Lfm3Audio::dbg_downsample_gpu(const AudioPrepared& p) const {
+  Lfm3Audio* self = const_cast<Lfm3Audio*>(this);
+  if (!gpu_ready_) self->load_gpu();
+  GpuWeights& G = *gw_;
+  Gpu& gpu = Gpu::get();
+  const int M = c_.mel_bins, C = c_.conv_channels, H = c_.hidden;
+  const int t1 = (p.frames + 1) / 2, m1 = (M + 1) / 2;
+  const int t2 = (t1 + 1) / 2, m2 = (m1 + 1) / 2;
+  const int t3 = (t2 + 1) / 2, m3 = (m2 + 1) / 2;
+  const size_t n1 = size_t(t1) * m1 * C, n2 = size_t(t2) * m2 * C, n3 = size_t(t3) * m3 * C;
+  const Buffer mel = gpu.alloc(p.mel.size() * 4 + 16, "ad_mel");
+  memcpy(mel.ptr(), p.mel.data(), p.mel.size() * 4);
+  Buffer s1 = gpu.alloc(n1 * 4 + 16, "ad_s1");
+  Buffer s2 = gpu.alloc(n2 * 4 + 16, "ad_s2");
+  Buffer s2o = gpu.alloc(n2 * 4 + 16, "ad_s2o");
+  Buffer s3 = gpu.alloc(n3 * 4 + 16, "ad_s3");
+  Buffer s3o = gpu.alloc(n3 * 4 + 16, "ad_s3o");
+  Buffer outb = gpu.alloc(size_t(t3) * H * 4 + 16, "ad_out");
+  auto e = gpu.begin();
+  ds_dispatches(*e, G, p, mel, s1, s2, s2o, s3, s3o, outb);
   e->commit();
   e->wait();
   std::vector<float> out(size_t(t3) * H);
@@ -605,57 +616,39 @@ std::vector<float> Lfm3Audio::dbg_downsample_gpu(const AudioPrepared& p) const {
   return out;
 }
 
-std::vector<float> Lfm3Audio::dbg_encode_gpu(const AudioPrepared& p) const {
-  Lfm3Audio* self = const_cast<Lfm3Audio*>(this);
-  if (!gpu_ready_) self->load_gpu();
-  // the kernels hardcode the config's fixed values (HD 96, the SWA window 32, the k3 short
-  // conv, the GQA split); any other config stays on the CPU forward.
-  if (c_.head_dim != 96 || c_.sliding_window != 32 || c_.conv_kernel != 3 ||
-      c_.heads % c_.kv_heads != 0)
-    return dbg_encode(p);
-  const GpuWeights& G = *gw_;
-  const int T = p.tokens, H = c_.hidden, I = c_.inter, HD = c_.head_dim, K = c_.conv_kernel;
+// the 17 blocks + the embedding norm, dispatches only (the caller owns the encoder and the
+// readback). h starts as the downsampled input, out ends as the encoder's last hidden state.
+void Lfm3Audio::blocks_dispatches(Encoder& e, GpuWeights& G, int T, Buffer& h, Buffer& hn, Buffer& g1,
+                                  Buffer& g2, Buffer& att, Buffer& ub, Buffer& vb, Buffer& out) const {
+  const int H = c_.hidden, I = c_.inter, HD = c_.head_dim, K = c_.conv_kernel;
   const int HQ = c_.heads, HKV = c_.kv_heads, KV = HD * HKV;
   const float eps = float(c_.rms_eps);
-  Gpu& gpu = Gpu::get();
-  const std::vector<float> down = dbg_downsample_gpu(p);
-  const size_t mO = 3 * size_t(H);  // >= I, >= H, >= KV: the GEMM scratch rows
-  const Buffer h = gpu.alloc(size_t(T) * H * 4 + 16, "ae_h");
-  memcpy(h.ptr(), down.data(), down.size() * 4);
-  const Buffer hn = gpu.alloc(size_t(T) * H * 4 + 16, "ae_hn");
-  const Buffer outb = gpu.alloc(size_t(T) * H * 4 + 16, "ae_out");
-  const Buffer g1 = gpu.alloc(size_t(T) * mO * 4 + 16, "ae_g1");
-  const Buffer g2 = gpu.alloc(size_t(T) * mO * 4 + 16, "ae_g2");
-  const Buffer att = gpu.alloc(size_t(T) * H * 4 + 16, "ae_att");
-  const Buffer ub = gpu.alloc(size_t(T) * H * 4 + 16, "ae_u");
-  const Buffer vb = gpu.alloc(size_t(T) * KV * 4 + 16, "ae_v");
-  auto e = gpu.begin();
   auto gemm = [&](const Buffer& w, const Buffer& x, const Buffer& y, uint o, uint in) {
     const A3 d{std::uint32_t(T), o, in};
-    e->use(gpu.pipeline("audio_gemm"));
-    e->buf(0, w);
-    e->buf(1, x);
-    e->buf(2, y);
-    e->val(3, d);
-    e->dispatch((size_t(T) * o + 255) / 256, 1, 1, 256);
+    e.use(Gpu::get().pipeline("audio_gemm"));
+    e.buf(0, w);
+    e.buf(1, x);
+    e.buf(2, y);
+    e.val(3, d);
+    e.dispatch((size_t(T) * o + 255) / 256, 1, 1, 256);
   };
   auto add = [&](const Buffer& dst, const Buffer& src, size_t n) {
     const std::uint32_t nn = std::uint32_t(n);
-    e->use(gpu.pipeline("audio_add"));
-    e->buf(0, dst);
-    e->buf(1, src);
-    e->val(2, nn);
-    e->dispatch((n + 255) / 256, 1, 1, 256);
+    e.use(Gpu::get().pipeline("audio_add"));
+    e.buf(0, dst);
+    e.buf(1, src);
+    e.val(2, nn);
+    e.dispatch((n + 255) / 256, 1, 1, 256);
   };
   auto rms = [&](const Buffer& x, const Buffer& w, const Buffer& y, uint dim) {
     const A2 d{std::uint32_t(T), dim};
-    e->use(gpu.pipeline("audio_rms"));
-    e->buf(0, x);
-    e->buf(1, w);
-    e->buf(2, y);
-    e->val(3, d);
-    e->val(4, eps);
-    e->dispatch(std::uint32_t(T), 1, 1, 128);  // exactly T groups: the kernel's barriers need no tail
+    e.use(Gpu::get().pipeline("audio_rms"));
+    e.buf(0, x);
+    e.buf(1, w);
+    e.buf(2, y);
+    e.val(3, d);
+    e.val(4, eps);
+    e.dispatch(std::uint32_t(T), 1, 1, 128);  // exactly T groups: the kernel's barriers need no tail
   };
   for (int L = 0; L < c_.depth; ++L) {
     const GpuWeights::BLK& B = G.blocks[size_t(L)];
@@ -665,21 +658,21 @@ std::vector<float> Lfm3Audio::dbg_encode_gpu(const AudioPrepared& p) const {
       gemm(B.in_proj, hn, g1, 3 * H, H);
       {
         const A2 d{std::uint32_t(T), std::uint32_t(H)};
-        e->use(gpu.pipeline("audio_gate_mul"));
-        e->buf(0, g1);
-        e->buf(1, ub);
-        e->val(2, d);
-        e->dispatch((size_t(T) * H + 255) / 256, 1, 1, 256);
+        e.use(Gpu::get().pipeline("audio_gate_mul"));
+        e.buf(0, g1);
+        e.buf(1, ub);
+        e.val(2, d);
+        e.dispatch((size_t(T) * H + 255) / 256, 1, 1, 256);
       }
       {
         const A3 d{std::uint32_t(T), std::uint32_t(H), std::uint32_t(K)};
-        e->use(gpu.pipeline("audio_cconv"));
-        e->buf(0, ub);
-        e->buf(1, g1);  // the in_proj rows: the C plane is token-interleaved (the kernel's p)
-        e->buf(2, B.cin_w);
-        e->buf(3, att);
-        e->val(4, d);
-        e->dispatch((size_t(T) * H + 255) / 256, 1, 1, 256);
+        e.use(Gpu::get().pipeline("audio_cconv"));
+        e.buf(0, ub);
+        e.buf(1, g1);  // the in_proj rows: the C plane is token-interleaved (the kernel's p)
+        e.buf(2, B.cin_w);
+        e.buf(3, att);
+        e.val(4, d);
+        e.dispatch((size_t(T) * H + 255) / 256, 1, 1, 256);
       }
       gemm(B.out_proj, att, g2, H, H);
       add(h, g2, size_t(T) * H);
@@ -689,28 +682,28 @@ std::vector<float> Lfm3Audio::dbg_encode_gpu(const AudioPrepared& p) const {
       gemm(B.v_proj, hn, vb, KV, H);   // v
       const A2 dq{std::uint32_t(T), std::uint32_t(HQ)};
       const A2 dk{std::uint32_t(T), std::uint32_t(HKV)};
-      e->use(gpu.pipeline("audio_qk_rope"));
-      e->buf(0, g1);
-      e->buf(1, B.qn);
-      e->val(2, dq);
-      e->val(3, eps);
-      e->dispatch((size_t(T) * HQ + 255) / 256, 1, 1, 256);
-      e->use(gpu.pipeline("audio_qk_rope"));
-      e->buf(0, g2);
-      e->buf(1, B.kn);
-      e->val(2, dk);
-      e->val(3, eps);
-      e->dispatch((size_t(T) * HKV + 255) / 256, 1, 1, 256);
+      e.use(Gpu::get().pipeline("audio_qk_rope"));
+      e.buf(0, g1);
+      e.buf(1, B.qn);
+      e.val(2, dq);
+      e.val(3, eps);
+      e.dispatch((size_t(T) * HQ + 255) / 256, 1, 1, 256);
+      e.use(Gpu::get().pipeline("audio_qk_rope"));
+      e.buf(0, g2);
+      e.buf(1, B.kn);
+      e.val(2, dk);
+      e.val(3, eps);
+      e.dispatch((size_t(T) * HKV + 255) / 256, 1, 1, 256);
       {
         const A4 d{std::uint32_t(T), std::uint32_t(HQ), std::uint32_t(HKV),
                    std::uint32_t(c_.sliding_window)};
-        e->use(gpu.pipeline("audio_attn_swa"));
-        e->buf(0, g1);
-        e->buf(1, g2);
-        e->buf(2, vb);
-        e->buf(3, att);
-        e->val(4, d);
-        e->dispatch((size_t(T) * HQ + 255) / 256, 1, 1, 256);
+        e.use(Gpu::get().pipeline("audio_attn_swa"));
+        e.buf(0, g1);
+        e.buf(1, g2);
+        e.buf(2, vb);
+        e.buf(3, att);
+        e.val(4, d);
+        e.dispatch((size_t(T) * HQ + 255) / 256, 1, 1, 256);
       }
       gemm(B.out_proj, att, g2, H, H);
       add(h, g2, size_t(T) * H);
@@ -721,16 +714,100 @@ std::vector<float> Lfm3Audio::dbg_encode_gpu(const AudioPrepared& p) const {
     gemm(B.w3, hn, g2, I, H);
     {
       const std::uint32_t n = std::uint32_t(size_t(T) * I);
-      e->use(gpu.pipeline("audio_silu_mul"));
-      e->buf(0, g1);
-      e->buf(1, g2);
-      e->val(2, n);
-      e->dispatch((size_t(T) * I + 255) / 256, 1, 1, 256);
+      e.use(Gpu::get().pipeline("audio_silu_mul"));
+      e.buf(0, g1);
+      e.buf(1, g2);
+      e.val(2, n);
+      e.dispatch((size_t(T) * I + 255) / 256, 1, 1, 256);
     }
     gemm(B.w2, g1, g2, H, I);
     add(h, g2, size_t(T) * H);
   }
-  rms(h, G.final_norm, outb, H);
+  rms(h, G.final_norm, out, H);
+}
+
+// the projector's dispatches only: LayerNorm -> L1 -> GELU -> L2 -> the bf16 rows.
+void Lfm3Audio::proj_dispatches(Encoder& e, GpuWeights& G, int T, const Buffer& x, Buffer& nrm,
+                                Buffer& y1, Buffer& y2, Buffer& emb) const {
+  const int H = c_.hidden, O = c_.out_hidden;
+  {  // the projector's LayerNorm (the fp32 sums, the CPU's mean/var form)
+    const A2 d{std::uint32_t(T), std::uint32_t(H)};
+    e.use(Gpu::get().pipeline("audio_proj_ln"));
+    e.buf(0, x);
+    e.buf(1, G.plnw);
+    e.buf(2, G.plnb);
+    e.buf(3, nrm);
+    e.val(4, d);
+    e.val(5, float(c_.proj_ln_eps));
+    e.dispatch(std::uint32_t(T), 1, 1, 128);
+  }
+  {  // L1 + the tanh-GELU
+    const A3 d{std::uint32_t(T), std::uint32_t(O), std::uint32_t(H)};
+    e.use(Gpu::get().pipeline("audio_gemm_b"));
+    e.buf(0, G.l1w);
+    e.buf(1, nrm);
+    e.buf(2, G.l1b);
+    e.buf(3, y1);
+    e.val(4, d);
+    e.dispatch((size_t(T) * O + 255) / 256, 1, 1, 256);
+    const std::uint32_t n = std::uint32_t(size_t(T) * O);
+    e.use(Gpu::get().pipeline("audio_gelu"));
+    e.buf(0, y1);
+    e.val(1, n);
+    e.dispatch((n + 255) / 256, 1, 1, 256);
+  }
+  {  // L2 + the bf16 rows
+    const A3 d{std::uint32_t(T), std::uint32_t(O), std::uint32_t(O)};
+    e.use(Gpu::get().pipeline("audio_gemm_b"));
+    e.buf(0, G.l2w);
+    e.buf(1, y1);
+    e.buf(2, G.l2b);
+    e.buf(3, y2);
+    e.val(4, d);
+    e.dispatch((size_t(T) * O + 255) / 256, 1, 1, 256);
+    const std::uint32_t n = std::uint32_t(size_t(T) * O);
+    e.use(Gpu::get().pipeline("audio_f2bf"));
+    e.buf(0, y2);
+    e.buf(1, emb);
+    e.val(2, n);
+    e.dispatch((n + 255) / 256, 1, 1, 256);
+  }
+}
+std::vector<float> Lfm3Audio::dbg_encode_gpu(const AudioPrepared& p) const {
+  Lfm3Audio* self = const_cast<Lfm3Audio*>(this);
+  if (!gpu_ready_) self->load_gpu();
+  // the kernels hardcode the config's fixed values (HD 96, the SWA window 32, the k3 short
+  // conv, the GQA split); any other config stays on the CPU forward.
+  if (c_.head_dim != 96 || c_.sliding_window != 32 || c_.conv_kernel != 3 ||
+      c_.heads % c_.kv_heads != 0)
+    return dbg_encode(p);
+  GpuWeights& G = *gw_;
+  const int T = p.tokens, H = c_.hidden, M = c_.mel_bins, C = c_.conv_channels;
+  const int HD = c_.head_dim, HKV = c_.kv_heads, KV = HD * HKV;
+  Gpu& gpu = Gpu::get();
+  const int t1 = (p.frames + 1) / 2, m1 = (M + 1) / 2;
+  const int t2 = (t1 + 1) / 2, m2 = (m1 + 1) / 2;
+  const int t3 = (t2 + 1) / 2, m3 = (m2 + 1) / 2;
+  const size_t n1 = size_t(t1) * m1 * C, n2 = size_t(t2) * m2 * C, n3 = size_t(t3) * m3 * C;
+  const Buffer mel = gpu.alloc(p.mel.size() * 4 + 16, "ad_mel");
+  memcpy(mel.ptr(), p.mel.data(), p.mel.size() * 4);
+  Buffer s1 = gpu.alloc(n1 * 4 + 16, "ad_s1");
+  Buffer s2 = gpu.alloc(n2 * 4 + 16, "ad_s2");
+  Buffer s2o = gpu.alloc(n2 * 4 + 16, "ad_s2o");
+  Buffer s3 = gpu.alloc(n3 * 4 + 16, "ad_s3");
+  Buffer s3o = gpu.alloc(n3 * 4 + 16, "ad_s3o");
+  const size_t mO = 3 * size_t(H);  // >= I, >= H, >= KV: the GEMM scratch rows
+  Buffer h = gpu.alloc(size_t(T) * H * 4 + 16, "ae_h");
+  Buffer hn = gpu.alloc(size_t(T) * H * 4 + 16, "ae_hn");
+  Buffer outb = gpu.alloc(size_t(T) * H * 4 + 16, "ae_out");
+  Buffer g1 = gpu.alloc(size_t(T) * mO * 4 + 16, "ae_g1");
+  Buffer g2 = gpu.alloc(size_t(T) * mO * 4 + 16, "ae_g2");
+  Buffer att = gpu.alloc(size_t(T) * H * 4 + 16, "ae_att");
+  Buffer ub = gpu.alloc(size_t(T) * H * 4 + 16, "ae_u");
+  Buffer vb = gpu.alloc(size_t(T) * KV * 4 + 16, "ae_v");
+  auto e = gpu.begin();
+  ds_dispatches(*e, G, p, mel, s1, s2, s2o, s3, s3o, h);
+  blocks_dispatches(*e, G, T, h, hn, g1, g2, att, ub, vb, outb);
   e->commit();
   e->wait();
   std::vector<float> out(size_t(T) * H);
@@ -738,8 +815,9 @@ std::vector<float> Lfm3Audio::dbg_encode_gpu(const AudioPrepared& p) const {
   return out;
 }
 
-// the full tower on the GPU: the downsample + the blocks (dbg_encode_gpu) + the projector
-// (LayerNorm -> L1 -> GELU -> L2 -> the bf16 rows), the CPU's encode() is the oracle.
+// the tower's production path: the whole downsample + blocks + projector in ONE command
+// buffer, one BOUNDED readout at the end — a wedged readout falls back to the CPU forward
+// instead of wedging the engine's queue (the TTS's containment pattern).
 Buffer Lfm3Audio::encode_gpu(const AudioPrepared& p) const {
   Lfm3Audio* self = const_cast<Lfm3Audio*>(this);
   if (!gpu_ready_) self->load_gpu();
@@ -747,62 +825,44 @@ Buffer Lfm3Audio::encode_gpu(const AudioPrepared& p) const {
   if (c_.head_dim != 96 || c_.sliding_window != 32 || c_.conv_kernel != 3 ||
       c_.heads % c_.kv_heads != 0)
     return self->encode(p);
-  const GpuWeights& G = *gw_;
-  const int T = p.tokens, H = c_.hidden, O = c_.out_hidden;
+  GpuWeights& G = *gw_;
+  const int T = p.tokens, H = c_.hidden, M = c_.mel_bins, C = c_.conv_channels, O = c_.out_hidden;
+  const int HD = c_.head_dim, HKV = c_.kv_heads, KV = HD * HKV;
   Gpu& gpu = Gpu::get();
-  const std::vector<float> enc = dbg_encode_gpu(p);
-  const Buffer xb = gpu.alloc(enc.size() * 4 + 16, "ae_enc");
-  memcpy(xb.ptr(), enc.data(), enc.size() * 4);
-  const Buffer nrm = gpu.alloc(size_t(T) * H * 4 + 16, "ae_nrm");
-  const Buffer y1 = gpu.alloc(size_t(T) * O * 4 + 16, "ae_y1");
-  const Buffer y2 = gpu.alloc(size_t(T) * O * 4 + 16, "ae_y2");
-  const Buffer ob = gpu.alloc(size_t(T) * O * 2 + 16, "ae_emb");
+  const int t1 = (p.frames + 1) / 2, m1 = (M + 1) / 2;
+  const int t2 = (t1 + 1) / 2, m2 = (m1 + 1) / 2;
+  const int t3 = (t2 + 1) / 2, m3 = (m2 + 1) / 2;
+  const size_t n1 = size_t(t1) * m1 * C, n2 = size_t(t2) * m2 * C, n3 = size_t(t3) * m3 * C;
+  const Buffer mel = gpu.alloc(p.mel.size() * 4 + 16, "ad_mel");
+  memcpy(mel.ptr(), p.mel.data(), p.mel.size() * 4);
+  Buffer s1 = gpu.alloc(n1 * 4 + 16, "ad_s1");
+  Buffer s2 = gpu.alloc(n2 * 4 + 16, "ad_s2");
+  Buffer s2o = gpu.alloc(n2 * 4 + 16, "ad_s2o");
+  Buffer s3 = gpu.alloc(n3 * 4 + 16, "ad_s3");
+  Buffer s3o = gpu.alloc(n3 * 4 + 16, "ad_s3o");
+  const size_t mO = 3 * size_t(H);
+  Buffer h = gpu.alloc(size_t(T) * H * 4 + 16, "ae_h");
+  Buffer hn = gpu.alloc(size_t(T) * H * 4 + 16, "ae_hn");
+  Buffer outb = gpu.alloc(size_t(T) * H * 4 + 16, "ae_out");
+  Buffer g1 = gpu.alloc(size_t(T) * mO * 4 + 16, "ae_g1");
+  Buffer g2 = gpu.alloc(size_t(T) * mO * 4 + 16, "ae_g2");
+  Buffer att = gpu.alloc(size_t(T) * H * 4 + 16, "ae_att");
+  Buffer ub = gpu.alloc(size_t(T) * H * 4 + 16, "ae_u");
+  Buffer vb = gpu.alloc(size_t(T) * KV * 4 + 16, "ae_v");
+  Buffer nrm = gpu.alloc(size_t(T) * H * 4 + 16, "ae_nrm");
+  Buffer y1 = gpu.alloc(size_t(T) * O * 4 + 16, "ae_y1");
+  Buffer y2 = gpu.alloc(size_t(T) * O * 4 + 16, "ae_y2");
+  Buffer emb = gpu.alloc(size_t(T) * O * 2 + 16, "ae_emb");
   auto e = gpu.begin();
-  {  // the projector's LayerNorm (the fp32 sums, the CPU's mean/var form)
-    const A2 d{std::uint32_t(T), std::uint32_t(H)};
-    e->use(gpu.pipeline("audio_proj_ln"));
-    e->buf(0, xb);
-    e->buf(1, G.plnw);
-    e->buf(2, G.plnb);
-    e->buf(3, nrm);
-    e->val(4, d);
-    e->val(5, float(c_.proj_ln_eps));
-    e->dispatch(std::uint32_t(T), 1, 1, 128);
-  }
-  {  // L1 + the tanh-GELU
-    const A3 d{std::uint32_t(T), std::uint32_t(O), std::uint32_t(H)};
-    e->use(gpu.pipeline("audio_gemm_b"));
-    e->buf(0, G.l1w);
-    e->buf(1, nrm);
-    e->buf(2, G.l1b);
-    e->buf(3, y1);
-    e->val(4, d);
-    e->dispatch((size_t(T) * O + 255) / 256, 1, 1, 256);
-    const std::uint32_t n = std::uint32_t(size_t(T) * O);
-    e->use(gpu.pipeline("audio_gelu"));
-    e->buf(0, y1);
-    e->val(1, n);
-    e->dispatch((size_t(T) * O + 255) / 256, 1, 1, 256);
-  }
-  {  // L2 + the bf16 rows
-    const A3 d{std::uint32_t(T), std::uint32_t(O), std::uint32_t(O)};
-    e->use(gpu.pipeline("audio_gemm_b"));
-    e->buf(0, G.l2w);
-    e->buf(1, y1);
-    e->buf(2, G.l2b);
-    e->buf(3, y2);
-    e->val(4, d);
-    e->dispatch((size_t(T) * O + 255) / 256, 1, 1, 256);
-    const std::uint32_t n = std::uint32_t(size_t(T) * O);
-    e->use(gpu.pipeline("audio_f2bf"));
-    e->buf(0, y2);
-    e->buf(1, ob);
-    e->val(2, n);
-    e->dispatch((n + 255) / 256, 1, 1, 256);
-  }
+  ds_dispatches(*e, G, p, mel, s1, s2, s2o, s3, s3o, h);
+  blocks_dispatches(*e, G, T, h, hn, g1, g2, att, ub, vb, outb);
+  proj_dispatches(*e, G, T, outb, nrm, y1, y2, emb);
   e->commit();
-  e->wait();
-  return ob;
+  // one bounded readout: a stuck TTS-style frame must not wedge the engine's command queue
+  const double readout_ms =
+      getenv("NI_AUDIO_READOUT_MS") ? std::atof(getenv("NI_AUDIO_READOUT_MS")) : 2000.0;
+  if (!e->wait_for(readout_ms)) return self->encode(p);
+  return emb;
 }
 
 // test hook: the tower's blocks + final norm (fp32), the "down.npy" stage of the reference dump

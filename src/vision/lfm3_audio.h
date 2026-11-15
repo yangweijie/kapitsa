@@ -94,6 +94,14 @@ class Lfm3Audio {
   void blocks(const float* x, int T, float* out) const;               // 17 layers, fp32 [T, hidden]
   void load_gpu();
   struct GpuWeights;
+  // the three dispatch sequences (no commit/wait; the caller owns the encoder + the readback)
+  void ds_dispatches(Encoder& e, GpuWeights& G, const AudioPrepared& p, const Buffer& mel,
+                      Buffer& s1, Buffer& s2, Buffer& s2o, Buffer& s3, Buffer& s3o,
+                      Buffer& out) const;
+  void blocks_dispatches(Encoder& e, GpuWeights& G, int T, Buffer& h, Buffer& hn, Buffer& g1,
+                         Buffer& g2, Buffer& att, Buffer& ub, Buffer& vb, Buffer& out) const;
+  void proj_dispatches(Encoder& e, GpuWeights& G, int T, const Buffer& x, Buffer& nrm,
+                       Buffer& y1, Buffer& y2, Buffer& emb) const;
   std::unique_ptr<GpuWeights> gw_;
   bool gpu_ready_ = false;
   std::string dir_;

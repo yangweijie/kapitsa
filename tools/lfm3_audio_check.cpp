@@ -3,12 +3,15 @@
 // lfm3_audio_ref_test), the downsampler's output, the encoder blocks' per-layer hidden states,
 // and the projector's output. Reads the reference's .npy files directly (the v2 header, fp32).
 //
-//   lfm3_audio_check CLIP.wav REFDIR [MODELDIR] [--gpu]
+//   lfm3_audio_check CLIP.wav REFDIR [MODELDIR] [--gpu] [--ab N]
 //
 // MODELDIR defaults to .lfm3-real/home/models/lfm3-omni-2b (the imported Omni, whose folder
 // carries audio.safetensors + audio_config.json from the mmproj --audio import). --gpu runs the
 // downsampler's Metal path (src/kernels/audio.metal) against the CPU oracle; it needs the GPU
-// lock, run it under `lockf -k /tmp/kapitsa-gpu.lock`.
+// lock, run it under `lockf -k /tmp/kapitsa-gpu.lock`. --ab N is the default-on evidence: N
+// interleaved A/B rounds of the CPU's encode() (A) vs the GPU's encode_gpu() (B), each with
+// the two outputs' agreement check, on an IDLE GPU (the AGENTS.md A/B posture), run under
+// `lockf -k /tmp/kapitsa-gpu.lock`.
 #include "vision/lfm3_audio.h"
 
 #include <cmath>
@@ -103,17 +106,21 @@ double compare(const std::vector<float>& got, const std::vector<float>& ref, con
 }  // namespace
 
 int main(int argc, char** argv) {
-  bool gpu_mode = false;
+  bool gpu_mode = false, ab_mode = false;
+  int ab_rounds = 5;
   std::vector<std::string> pos;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--gpu")
       gpu_mode = true;
-    else
+    else if (a == "--ab") {
+      ab_mode = true;
+      if (i + 1 < argc) ab_rounds = atoi(argv[++i]);
+    } else
       pos.push_back(a);
   }
   if (pos.size() < 2) {
-    fprintf(stderr, "usage: lfm3_audio_check CLIP.wav REFDIR [MODELDIR] [--gpu]\n");
+    fprintf(stderr, "usage: lfm3_audio_check CLIP.wav REFDIR [MODELDIR] [--gpu] [--ab N]\n");
     return 2;
   }
   const std::string clip = pos[0], refdir = pos[1];
@@ -139,6 +146,57 @@ int main(int argc, char** argv) {
   const auto p = tower.prepare(bytes);
   auto t1 = std::chrono::steady_clock::now();
   fprintf(stderr, "clip: %d frames, %d tokens (prepare %.0f ms)\n", p.frames, p.tokens, ms(t0, t1));
+  if (ab_mode) {
+    // the default-on evidence (the AGENTS.md A/B posture): N interleaved A/B rounds of the CPU's
+    // encode() (A) vs the GPU's encode_gpu() (B) on an IDLE GPU (run under lockf), each round
+    // carrying its output check — the two towers' bf16 rows must agree (1 bf16 ulp at O(1)
+    // values, the band the --gpu check measured).
+    tower.load();
+    const size_t nbf = size_t(p.tokens) * size_t(tower.out_dim());
+    double cpu_ms[100], gpu_ms[100];
+    int band_fail = 0;
+    for (int i = 0; i < ab_rounds && i < 100; ++i) {
+      auto a0 = std::chrono::steady_clock::now();
+      const ni::Buffer cemb = tower.encode(p);
+      auto a1 = std::chrono::steady_clock::now();
+      const ni::Buffer gemb = tower.encode_gpu(p);
+      auto a2 = std::chrono::steady_clock::now();
+      cpu_ms[i] = ms(a0, a1);
+      gpu_ms[i] = ms(a1, a2);
+      double num = 0, da = 0, db = 0, mx = 0;
+      const uint16_t* hc = reinterpret_cast<const uint16_t*>(cemb.ptr());
+      const uint16_t* hg = reinterpret_cast<const uint16_t*>(gemb.ptr());
+      for (size_t j = 0; j < nbf; ++j) {
+        uint32_t uc = uint32_t(hc[j]) << 16, ug = uint32_t(hg[j]) << 16;
+        float fc, fg;
+        memcpy(&fc, &uc, 4);
+        memcpy(&fg, &ug, 4);
+        const double d = double(fc) - double(fg);
+        num += d * d;
+        da += double(fc) * double(fc);
+        db += double(fg) * double(fg);
+        mx = std::max(mx, std::abs(d));
+      }
+      const double cos = da * db == 0 ? 1.0 : (da + db - num) / (2.0 * std::sqrt(da * db));
+      const bool ok = cos > 0.9995 && mx < 1e-2;
+      if (!ok) ++band_fail;
+      fprintf(stderr, "A/B %d: cpu %.1f ms  gpu %.1f ms (%.1fx)  cos %.7f  max|d| %.6g  %s\n", i, cpu_ms[i],
+              gpu_ms[i], gpu_ms[i] > 0 ? cpu_ms[i] / gpu_ms[i] : 0.0, cos, mx, ok ? "" : "OUT OF BAND");
+    }
+    double cpu_sorted[100], gpu_sorted[100];
+    memcpy(cpu_sorted, cpu_ms, sizeof(double) * size_t(ab_rounds));
+    memcpy(gpu_sorted, gpu_ms, sizeof(double) * size_t(ab_rounds));
+    std::sort(cpu_sorted, cpu_sorted + ab_rounds);
+    std::sort(gpu_sorted, gpu_sorted + ab_rounds);
+    fprintf(stderr, "A/B medians: cpu %.1f ms  gpu %.1f ms\n", cpu_sorted[ab_rounds / 2],
+            gpu_sorted[ab_rounds / 2]);
+    if (band_fail) {
+      fprintf(stderr, "A/B: %d round(s) outside the band\n", band_fail);
+      return 1;
+    }
+    fprintf(stderr, "ok ab (the GPU tower's rows agree with the CPU's every round)\n");
+    return 0;
+  }
   {
     // ref_ds.npy holds the DOWNSAMPLER's output (layer 0's input, a forward-pre-hook dump);
     // down.npy holds the ENCODER's last hidden state — ref_audio.py dumps enc(...)'s return.
