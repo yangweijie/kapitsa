@@ -438,12 +438,25 @@ std::vector<float> Lfm3Audio::dbg_downsample(const AudioPrepared& p) const {
 struct Lfm3Audio::GpuWeights {
   Buffer ci_w, ci_b, cm_w, cm_b, ce_w, ce_b;  // the depthwise k3 convs [C, 9] + biases [C] (bf16)
   Buffer lm_w, lm_b, le_w, le_b;               // the 1x1 mixes [C, C] + [C]
-  Buffer lo_w, lo_b;                           // lin_out [H, FM] + [H]
+  Buffer lo_w, lo_b;                            // lin_out [H, FM] + [H]
+  struct BLK {
+    Buffer onw, fnw;   // the blocks' RMSNorm weights [H] (fp32: widened from the bf16 checkpoint)
+    Buffer cin_w;      // the conv blocks' per-channel short conv [H, K] (bf16)
+    Buffer in_proj;    // conv: [3H, H]; attn: q_proj [H, H] (bf16)
+    Buffer k_proj, v_proj;  // attn: [KV, H] (bf16)
+    Buffer out_proj;   // [H, H] (bf16)
+    Buffer qn, kn;     // attn's per-head layernorms [HD] (fp32)
+    Buffer w1, w2, w3; // the FFN's [I, H], [H, I], [I, H] (bf16)
+  };
+  std::vector<BLK> blocks;
+  Buffer final_norm;  // the embedding norm [H] (fp32)
 };
 
 namespace {
 struct Adims { std::uint32_t a, b, c, d; };  // audio.metal's Ds
-struct A2 { std::uint32_t x, y; };            // audio.metal's uint2
+struct A2 { std::uint32_t x, y; };           // audio.metal's uint2
+struct A3 { std::uint32_t x, y, z, p; };  // audio.metal's uint3 (the MSL argument is 16 bytes)
+struct A4 { std::uint32_t x, y, z, w; };     // audio.metal's uint4
 }  // namespace
 
 void Lfm3Audio::load_gpu() {
@@ -454,6 +467,13 @@ void Lfm3Audio::load_gpu() {
   auto up = [](Buffer& dst, const std::vector<uint16_t>& src, const char* label) {
     dst = Gpu::get().alloc(src.size() * 2 + 16, label);
     memcpy(dst.ptr(), src.data(), src.size() * 2);
+  };
+  auto upf = [](Buffer& dst, const std::vector<uint16_t>& src, const char* label) {
+    // the norms' weights: widened fp32 (the kernels read `const device float*`)
+    std::vector<float> f(src.size());
+    for (size_t i = 0; i < src.size(); ++i) f[i] = bf16_to_f32(src[i]);
+    dst = Gpu::get().alloc(src.size() * 4 + 16, label);
+    memcpy(dst.ptr(), f.data(), f.size() * 4);
   };
   const Weights& W = *w_;
   up(G.ci_w, W.ci_w, "ad_w");
@@ -468,6 +488,24 @@ void Lfm3Audio::load_gpu() {
   up(G.le_b, W.le_b, "ad_b");
   up(G.lo_w, W.lo_w, "ad_w");
   up(G.lo_b, W.lo_b, "ad_b");
+  G.blocks.resize(W.blocks.size());
+  for (size_t i = 0; i < W.blocks.size(); ++i) {
+    const Weights::Block& B = W.blocks[i];
+    GpuWeights::BLK& GB = G.blocks[i];
+    upf(GB.onw, B.onw, "ad_nw");
+    upf(GB.fnw, B.fnw, "ad_nw");
+    upf(GB.qn, B.qn, "ad_nw");
+    upf(GB.kn, B.kn, "ad_nw");
+    up(GB.cin_w, B.cin_w, "ad_w");
+    up(GB.in_proj, B.in_proj, "ad_w");
+    up(GB.k_proj, B.k_proj, "ad_w");
+    up(GB.v_proj, B.v_proj, "ad_w");
+    up(GB.out_proj, B.out_proj, "ad_w");
+    up(GB.w1, B.w1, "ad_w");
+    up(GB.w2, B.w2, "ad_w");
+    up(GB.w3, B.w3, "ad_w");
+  }
+  upf(G.final_norm, W.final_norm, "ad_nw");
   gpu_ready_ = true;
 }
 
@@ -554,6 +592,139 @@ std::vector<float> Lfm3Audio::dbg_downsample_gpu(const AudioPrepared& p) const {
   e->commit();
   e->wait();
   std::vector<float> out(size_t(t3) * H);
+  memcpy(out.data(), outb.ptr(), out.size() * 4);
+  return out;
+}
+
+std::vector<float> Lfm3Audio::dbg_encode_gpu(const AudioPrepared& p) const {
+  Lfm3Audio* self = const_cast<Lfm3Audio*>(this);
+  if (!gpu_ready_) self->load_gpu();
+  // the kernels hardcode the config's fixed values (HD 96, the SWA window 32, the k3 short
+  // conv, the GQA split); any other config stays on the CPU forward.
+  if (c_.head_dim != 96 || c_.sliding_window != 32 || c_.conv_kernel != 3 ||
+      c_.heads % c_.kv_heads != 0)
+    return dbg_encode(p);
+  const GpuWeights& G = *gw_;
+  const int T = p.tokens, H = c_.hidden, I = c_.inter, HD = c_.head_dim, K = c_.conv_kernel;
+  const int HQ = c_.heads, HKV = c_.kv_heads, KV = HD * HKV;
+  const float eps = float(c_.rms_eps);
+  Gpu& gpu = Gpu::get();
+  const std::vector<float> down = dbg_downsample_gpu(p);
+  const size_t mO = 3 * size_t(H);  // >= I, >= H, >= KV: the GEMM scratch rows
+  const Buffer h = gpu.alloc(size_t(T) * H * 4 + 16, "ae_h");
+  memcpy(h.ptr(), down.data(), down.size() * 4);
+  const Buffer hn = gpu.alloc(size_t(T) * H * 4 + 16, "ae_hn");
+  const Buffer outb = gpu.alloc(size_t(T) * H * 4 + 16, "ae_out");
+  const Buffer g1 = gpu.alloc(size_t(T) * mO * 4 + 16, "ae_g1");
+  const Buffer g2 = gpu.alloc(size_t(T) * mO * 4 + 16, "ae_g2");
+  const Buffer att = gpu.alloc(size_t(T) * H * 4 + 16, "ae_att");
+  const Buffer ub = gpu.alloc(size_t(T) * H * 4 + 16, "ae_u");
+  const Buffer vb = gpu.alloc(size_t(T) * KV * 4 + 16, "ae_v");
+  auto e = gpu.begin();
+  auto gemm = [&](const Buffer& w, const Buffer& x, const Buffer& y, uint o, uint in) {
+    const A3 d{std::uint32_t(T), o, in};
+    e->use(gpu.pipeline("audio_gemm"));
+    e->buf(0, w);
+    e->buf(1, x);
+    e->buf(2, y);
+    e->val(3, d);
+    e->dispatch((size_t(T) * o + 255) / 256, 1, 1, 256);
+  };
+  auto add = [&](const Buffer& dst, const Buffer& src, size_t n) {
+    const std::uint32_t nn = std::uint32_t(n);
+    e->use(gpu.pipeline("audio_add"));
+    e->buf(0, dst);
+    e->buf(1, src);
+    e->val(2, nn);
+    e->dispatch((n + 255) / 256, 1, 1, 256);
+  };
+  auto rms = [&](const Buffer& x, const Buffer& w, const Buffer& y, uint dim) {
+    const A2 d{std::uint32_t(T), dim};
+    e->use(gpu.pipeline("audio_rms"));
+    e->buf(0, x);
+    e->buf(1, w);
+    e->buf(2, y);
+    e->val(3, d);
+    e->val(4, eps);
+    e->dispatch(std::uint32_t(T), 1, 1, 128);  // exactly T groups: the kernel's barriers need no tail
+  };
+  for (int L = 0; L < c_.depth; ++L) {
+    const GpuWeights::BLK& B = G.blocks[size_t(L)];
+    rms(h, B.onw, hn, H);
+    if (c_.layer_types[size_t(L)] == 'C') {
+      // in_proj -> [B, C, x]; u = B * x; y = C * causal_kconv(u); out_proj; +h
+      gemm(B.in_proj, hn, g1, 3 * H, H);
+      {
+        const A2 d{std::uint32_t(T), std::uint32_t(H)};
+        e->use(gpu.pipeline("audio_gate_mul"));
+        e->buf(0, g1);
+        e->buf(1, ub);
+        e->val(2, d);
+        e->dispatch((size_t(T) * H + 255) / 256, 1, 1, 256);
+      }
+      {
+        const A3 d{std::uint32_t(T), std::uint32_t(H), std::uint32_t(K)};
+        e->use(gpu.pipeline("audio_cconv"));
+        e->buf(0, ub);
+        e->buf(1, g1);  // the in_proj rows: the C plane is token-interleaved (the kernel's p)
+        e->buf(2, B.cin_w);
+        e->buf(3, att);
+        e->val(4, d);
+        e->dispatch((size_t(T) * H + 255) / 256, 1, 1, 256);
+      }
+      gemm(B.out_proj, att, g2, H, H);
+      add(h, g2, size_t(T) * H);
+    } else {
+      gemm(B.in_proj, hn, g1, H, H);  // q
+      gemm(B.k_proj, hn, g2, KV, H);  // k
+      gemm(B.v_proj, hn, vb, KV, H);   // v
+      const A2 dq{std::uint32_t(T), std::uint32_t(HQ)};
+      const A2 dk{std::uint32_t(T), std::uint32_t(HKV)};
+      e->use(gpu.pipeline("audio_qk_rope"));
+      e->buf(0, g1);
+      e->buf(1, B.qn);
+      e->val(2, dq);
+      e->val(3, eps);
+      e->dispatch((size_t(T) * HQ + 255) / 256, 1, 1, 256);
+      e->use(gpu.pipeline("audio_qk_rope"));
+      e->buf(0, g2);
+      e->buf(1, B.kn);
+      e->val(2, dk);
+      e->val(3, eps);
+      e->dispatch((size_t(T) * HKV + 255) / 256, 1, 1, 256);
+      {
+        const A4 d{std::uint32_t(T), std::uint32_t(HQ), std::uint32_t(HKV),
+                   std::uint32_t(c_.sliding_window)};
+        e->use(gpu.pipeline("audio_attn_swa"));
+        e->buf(0, g1);
+        e->buf(1, g2);
+        e->buf(2, vb);
+        e->buf(3, att);
+        e->val(4, d);
+        e->dispatch((size_t(T) * HQ + 255) / 256, 1, 1, 256);
+      }
+      gemm(B.out_proj, att, g2, H, H);
+      add(h, g2, size_t(T) * H);
+    }
+    // the FFN: ffn_norm -> w1/w3 -> silu * w3 -> w2 -> +h
+    rms(h, B.fnw, hn, H);
+    gemm(B.w1, hn, g1, I, H);
+    gemm(B.w3, hn, g2, I, H);
+    {
+      const std::uint32_t n = std::uint32_t(size_t(T) * I);
+      e->use(gpu.pipeline("audio_silu_mul"));
+      e->buf(0, g1);
+      e->buf(1, g2);
+      e->val(2, n);
+      e->dispatch((size_t(T) * I + 255) / 256, 1, 1, 256);
+    }
+    gemm(B.w2, g1, g2, H, I);
+    add(h, g2, size_t(T) * H);
+  }
+  rms(h, G.final_norm, outb, H);
+  e->commit();
+  e->wait();
+  std::vector<float> out(size_t(T) * H);
   memcpy(out.data(), outb.ptr(), out.size() * 4);
   return out;
 }
@@ -666,6 +837,10 @@ void Lfm3Audio::blocks(const float* x, int T, float* out) const {
       }
       const double scale = 1.0 / std::sqrt(double(HD));
       for (int t = 0; t < T; ++t) {
+        // the C blocks' out_proj gemv wrote this buffer last (the blocks share `att`); the
+        // s-loop accumulates, so zero it per token (the t=0 of an S block that follows a C
+        // block used to add onto the C block's stale row, the HF's t=0 is v[0] alone)
+        std::fill(att.begin(), att.end(), 0.f);
         const int t0 = std::max(0, t - c_.sliding_window + 1);
         for (int hh = 0; hh < HQ; ++hh) {
           const int hk = hh / (HQ / HKV);  // repeat_kv: q head h reads kv head h / (HQ/HKV)
@@ -695,7 +870,6 @@ void Lfm3Audio::blocks(const float* x, int T, float* out) const {
         }
         gemv(B.out_proj.data(), att.data(), H, H, y.data());
         add_into(&h[size_t(t) * H], y.data(), size_t(H));
-        std::fill(att.begin(), att.end(), 0.f);
       }
     }
     if (getenv("LFM3_AUDIO_DUMP")) {

@@ -198,6 +198,30 @@ int main(int argc, char** argv) {
       return 1;
     }
     fprintf(stderr, "ok gpu ds (the downsampler's Metal path matches the CPU oracle)\n");
+    // the 17 encoder blocks: the CPU's attention math is double, the GPU's fp32, and the stack
+    // is 17 layers deep — the band is wider than the downsampler's (cos > 0.9995, max|d| <
+    // 5e-2 on O(1) hidden states).
+    const auto enc_cpu = tower.dbg_encode(p);
+    const auto enc_gpu = tower.dbg_encode_gpu(p);
+    if (enc_gpu.size() != enc_cpu.size()) {
+      fprintf(stderr, "gpu enc: size %zu vs cpu %zu\n", enc_gpu.size(), enc_cpu.size());
+      return 1;
+    }
+    num = 0, da = 0, db = 0, mx = 0;
+    for (size_t i = 0; i < enc_gpu.size(); ++i) {
+      const double d = double(enc_gpu[i]) - double(enc_cpu[i]);
+      num += d * d;
+      da += double(enc_gpu[i]) * double(enc_gpu[i]);
+      db += double(enc_cpu[i]) * double(enc_cpu[i]);
+      mx = std::max(mx, std::abs(d));
+    }
+    const double ecos = da * db == 0 ? 1.0 : (da + db - num) / (2.0 * std::sqrt(da * db));
+    fprintf(stderr, "gpu enc: cosine vs cpu %.7f  max|d| %.6g\n", ecos, mx);
+    if (ecos < 0.9995 || mx > 5e-2) {
+      fprintf(stderr, "gpu enc outside the fp32 band (cos > 0.9995, max|d| < 5e-2)\n");
+      return 1;
+    }
+    fprintf(stderr, "ok gpu enc (the encoder blocks' Metal path matches the CPU oracle)\n");
     return 0;
   }
   tower.load();
