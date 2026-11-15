@@ -398,9 +398,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
     e->buf(3, W.proj);
     e->val(4, dims);
     e->dispatch(kCodebooks * kHidden, 1, 1, 64);
-    e->commit_and_wait();
-    e = Gpu::get().begin();
-  }
+      }
   // the slot adds (masked: the mask_embedding; revealed: the code's embedding), an element kernel
   // (no dedicated kernel: each slot's row add runs as tts_add over the code/mask embedding pointer
   //  selected on the host — 12 host-side selections, 12 small dispatches through one encoder)
@@ -451,33 +449,23 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
 
   int pick = 0;
   std::vector<float> logits_host(size_t(kCodebooks) * kCodebookSize);
-  std::vector<float> cpu_logits;
-  if (getenv("TTS_DBG")) {
-    cpu_logits.resize(size_t(kCodebooks) * kCodebookSize);
-    forward(hidden, std::vector<int>(kCodebooks, 0), std::vector<uint8_t>(kCodebooks, 1), cpu_logits);
-  }
   for (int pass = 0; pass < 3; ++pass) {
     std::vector<uint8_t> masked(kCodebooks);
     for (int i = 0; i < kCodebooks; ++i) masked[size_t(i)] = !revealed[size_t(i)];
     fill_adds();
-    memcpy(adds.ptr(), adds.ptr(), 0);  // (the staging was written on the host; the copy is done)
     // x = proj + adds
     memcpy(W.x.ptr(), adds.ptr(), size_t(kCodebooks) * kHidden * 4);
     add12(W.x, W.proj);
-    e->commit_and_wait();
-    e = Gpu::get().begin();
-
+    
     // the trunk: 3 layers
     for (int l = 0; l < kLayers; ++l) {
       const GpuW::LG& G = W.L[size_t(l)];
       rms12(W.xn, W.x, G.op_norm);
-      gemv_rows(W.q, G.q, W.xn, W.zero, kCodebooks * kHidden, kHidden);
-      gemv_rows(W.k, G.k, W.xn, W.zero, kCodebooks * kKvHeads * kHeadDim, kHidden);
-      gemv_rows(W.v, G.v, W.xn, W.zero, kCodebooks * kKvHeads * kHeadDim, kHidden);
-      gemv_rows(W.gated, G.gate, W.xn, W.zero, kCodebooks * kHeads, kHidden);
-      e->commit_and_wait();
-    e = Gpu::get().begin();
-      // the q/k rope + the q/k norms (32+8 heads per slot, one thread per head)
+      gemv_rows(W.q, G.q, W.xn, W.zero, kHidden, kHidden);
+      gemv_rows(W.k, G.k, W.xn, W.zero, kKvHeads * kHeadDim, kHidden);
+      gemv_rows(W.v, G.v, W.xn, W.zero, kKvHeads * kHeadDim, kHidden);
+      gemv_rows(W.gated, G.gate, W.xn, W.zero, kHeads, kHidden);
+            // the q/k rope + the q/k norms (32+8 heads per slot, one thread per head)
       // two separate encoder segments: val() writes the argument buffer the NEXT dispatch
       // reads, so a second val() before the first dispatch would clobber q's is_k
       for (uint is_k = 0; is_k < 2; ++is_k) {
@@ -488,9 +476,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
         e->buf(3, G.kn);
         e->val(4, is_k);
         e->dispatch(is_k ? kCodebooks * kKvHeads : kCodebooks * kHeads, 1, 1, 64);
-        e->commit_and_wait();
-        e = Gpu::get().begin();
-      }
+              }
       // the attention (12 threads in one group) then the o_proj + the residual
       e->use(Gpu::get().pipeline("tts_attn12"));
       e->buf(0, W.q);
@@ -499,30 +485,24 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->buf(3, W.gated);
       e->buf(4, W.att);
       e->dispatch(1, 1, 1, 12);
-      e->commit_and_wait();
-    e = Gpu::get().begin();
-      gemv_rows(W.tmp, G.o, W.att, W.zero, kCodebooks * kHidden, kHidden);
+            gemv_rows(W.tmp, G.o, W.att, W.zero, kHidden, kHidden);
       add12(W.x, W.tmp);
       // the FFN half
       rms12(W.xn, W.x, G.ffn_norm);
-      gemv_rows(W.gi, G.w1, W.xn, W.zero, kCodebooks * kFfn, kHidden);
-      gemv_rows(W.ui, G.w3, W.xn, W.zero, kCodebooks * kFfn, kHidden);
+      gemv_rows(W.gi, G.w1, W.xn, W.zero, kFfn, kHidden);
+      gemv_rows(W.ui, G.w3, W.xn, W.zero, kFfn, kHidden);
       e->use(Gpu::get().pipeline("tts_silu"));
       e->buf(0, W.gi);
       e->buf(1, W.ui);
       e->dispatch(kCodebooks * kFfn, 1, 1, 256);
-      gemv_rows(W.tmp, G.w2, W.gi, W.zero, kCodebooks * kHidden, kFfn);
+      gemv_rows(W.tmp, G.w2, W.gi, W.zero, kHidden, kFfn);
       add12(W.x, W.tmp);
-      e->commit_and_wait();
-    e = Gpu::get().begin();
-    }
+          }
     // the heads: the final norm, then EACH slot's own embedding_norm (in place), then the
     // 12 tied [2017, 1024] gemvs. The CPU oracle does both norms — one final_norm over all
     // slots, then a per-codebook RMSNorm before its head.
     rms12(W.xn, W.x, W.final_norm);
-    e->commit_and_wait();
-    e = Gpu::get().begin();
-    for (int c = 0; c < kCodebooks; ++c) {
+        for (int c = 0; c < kCodebooks; ++c) {
       const float eps = 1e-5f;
       e->use(Gpu::get().pipeline("tts_rms"));
       e->buf(0, W.xn, size_t(c) * kHidden * 4);
@@ -531,9 +511,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->val(3, eps);
       e->dispatch(1, 1, 1, 128);
     }
-    e->commit_and_wait();
-    e = Gpu::get().begin();
-    for (int c = 0; c < kCodebooks; ++c) {
+        for (int c = 0; c < kCodebooks; ++c) {
       const Dims dims{kCodebookSize, kHidden};
       e->use(Gpu::get().pipeline("tts_gemv"));
       e->buf(0, W.emb[size_t(c)]);
@@ -543,22 +521,9 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
       e->val(4, dims);
       e->dispatch(kCodebookSize, 1, 1, 64);
     }
-    e->commit_and_wait();
+    e->commit_and_wait();   // one command buffer per MaskGIT pass (the CPU reads the logits)
     e = Gpu::get().begin();
     memcpy(logits_host.data(), W.logits.ptr(), logits_host.size() * 4);
-    if (getenv("TTS_DBG") && pass == 0) {
-      double dot = 0, da = 0, db = 0, mx = 0;
-      for (size_t i = 0; i < logits_host.size(); ++i) {
-        const double d = double(logits_host[i]) - double(cpu_logits[i]);
-        dot += d * d; da += double(logits_host[i]) * double(logits_host[i]);
-        db += double(cpu_logits[i]) * double(cpu_logits[i]);
-        mx = std::max(mx, std::abs(d));
-      }
-      const double cosv = (da * db) == 0 ? 0.0 : (da + db - dot) / (2.0 * std::sqrt(da * db));
-      logi("tts dbg: pass0 logits cosine %.6f max|d| %.4f gpu[0..3] %.3f %.3f %.3f cpu %.3f %.3f %.3f",
-           cosv, mx, logits_host[0], logits_host[1], logits_host[2], cpu_logits[0], cpu_logits[1], cpu_logits[2]);
-    }
-
     // the reveal (the CPU sampler's tail, unchanged)
     for (int j = 0; j < kSchedule[pass]; ++j) {
       const int c = order[size_t(pick++)];

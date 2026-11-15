@@ -114,6 +114,22 @@ int main(int argc, char** argv) {
     ok("the MaskGIT sampler: the first pass's codes (fixed order) are the all-masked argmax",
        first_pass && framed.size() == 12);
   }
+  {
+    // the GPU path vs the CPU oracle (the same frame, the same fixed reveal order)
+    ni::tts::DepthDecoder gdec(ckpt);
+    gdec.load_gpu();
+    const auto& rec0 = meta["records"][0];
+    const std::vector<float> hidden = rec0["hidden"].get<std::vector<float>>();
+    std::vector<int> fixed(12);
+    for (int i = 0; i < 12; ++i) fixed[size_t(i)] = i;
+    const std::vector<int> cpu = dec.sample_frame(hidden, 0.0f, fixed);
+    const std::vector<int> gpu = gdec.sample_frame_gpu(hidden, 0.0f, fixed);
+    const std::vector<int> gpu2 = gdec.sample_frame_gpu(hidden, 0.0f, fixed);
+    int same = 0;
+    for (int c = 0; c < 12; ++c) same += cpu[size_t(c)] == gpu[size_t(c)];
+    ok("the depth decoder's GPU path: the codes match the CPU oracle (argmax), deterministic",
+       same >= 10 && gpu == gpu2);
+  }
   printf("PASS (%d ok, %d failed)\n", passed, failed);
   return failed ? 1 : 0;
 }

@@ -502,7 +502,9 @@ std::vector<int> Lfm3::speech_frame(uint64_t seed) {
   // the last step's pre-head state (xn_ holds the final-normed hidden the head read) — read back
   std::vector<float> hidden(size_t(cfg_.hidden));
   memcpy(hidden.data(), xn_.as<float>(), hidden.size() * 4);
-  return tts_->sample_frame(hidden, audio_temperature_, seed);
+  // the depth decoder's per-frame Metal path (the CPU forward stays the oracle); the first
+  // frame loads the weights once (audio-gen.safetensors, bf16 on the device).
+  return tts_->sample_frame_gpu(hidden, audio_temperature_, seed);
 }
 
 // x's rows through an RMSNorm (norm's weight) into y as halfs; without a norm, plain halfs.
