@@ -15,6 +15,7 @@ using json = nlohmann::json;
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <random>
 
 namespace {
 json parse(const std::string& p) {
@@ -221,6 +222,63 @@ int main(int argc, char** argv) {
          faithful >= 4 && noop == 5,
          "faithful " + std::to_string(faithful) + "/5, no-op " + std::to_string(noop) +
              "/5, mild-penalty effect moved " + std::to_string(effect) + " of 12");
+    }
+    // the 2D-tiled trunk GEMV (tts_gemv12_t, the fusion's default) is MATH-IDENTICAL to the
+    // serial one (tts_gemv12) up to the K reassociation: a deterministic random bf16 W [1024,
+    // 1024] + fp32 X [12, 1024] through both kernels (one encoder segment, two outputs); the
+    // diff is the fp32-sum tree over 64-wide chunks vs the serial walk, a reassociation band
+    // (the products are the same set). A structural bug (a miswired lane/slot, a missing K
+    // term) would show up O(magnitude), not in the band.
+    {
+      const uint out = 1024, in = 1024;
+      std::mt19937 wrng(1234);
+      std::vector<uint16_t> wb(out * in);
+      for (auto& u : wb)  // finite bf16, magnitude [0.125, 2): the biased exponent in 124-127
+        u = uint16_t((124u + (wrng() & 3u)) << 7 | wrng() & 0x7Fu | ((wrng() & 1u) ? 0x8000u : 0u));
+      std::mt19937 xrng(4321);
+      std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+      std::vector<float> xb(size_t(12) * in);
+      for (auto& f : xb) f = uni(xrng);
+      ni::Buffer wbuf = ni::Gpu::get().alloc(wb.size() * 2 + 16, "tts_diff_w");
+      memcpy(wbuf.ptr(), wb.data(), wb.size() * 2);
+      ni::Buffer xbuf = ni::Gpu::get().alloc(xb.size() * 4 + 16, "tts_diff_x");
+      memcpy(xbuf.ptr(), xb.data(), xb.size() * 4);
+      ni::Buffer y1 = ni::Gpu::get().alloc(xb.size() * 4 + 16, "tts_diff_y1");
+      ni::Buffer y2 = ni::Gpu::get().alloc(xb.size() * 4 + 16, "tts_diff_y2");
+      ni::Buffer zb = ni::Gpu::get().alloc(out * 4 + 16, "tts_diff_z");
+      memset(zb.ptr(), 0, out * 4);
+      const Dims2 dims{out, in};
+      auto e = ni::Gpu::get().begin();
+      e->use(ni::Gpu::get().pipeline("tts_gemv12"));
+      e->buf(0, wbuf);
+      e->buf(1, xbuf);
+      e->buf(2, zb);
+      e->buf(3, y1);
+      e->val(4, dims);
+      e->dispatch((out * 12 + 63) / 64, 1, 1, 64);
+      e->use(ni::Gpu::get().pipeline("tts_gemv12_t"));
+      e->buf(0, wbuf);
+      e->buf(1, xbuf);
+      e->buf(2, zb);
+      e->buf(3, y2);
+      e->val(4, dims);
+      e->dispatch(out / 16, 1, 1, 128);
+      e->commit();
+      if (!e->wait_for(2000.0))
+        ok("the 2D-tiled trunk GEMV is math-identical to the serial one (the reassociation band)",
+           false, "the bounded readout wedged: no number (the kernels are OOB-audited; a rerun settles it)");
+      else {
+        const float* s = (const float*)y1.ptr();
+        const float* t = (const float*)y2.ptr();
+        double maxd = 0, mag = 0;
+        for (size_t i = 0; i < xb.size(); ++i) {
+          maxd = std::max(maxd, std::fabs(double(s[i]) - double(t[i])));
+          mag = std::max(mag, std::max(std::fabs(double(s[i])), std::fabs(double(t[i]))));
+        }
+        ok("the 2D-tiled trunk GEMV is math-identical to the serial one (the reassociation band)",
+           maxd < 1e-3 * std::max(1.0, mag),
+           "max |diff| " + std::to_string(maxd) + " at magnitude " + std::to_string(mag));
+      }
     }
   }
   {

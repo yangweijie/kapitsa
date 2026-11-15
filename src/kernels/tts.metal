@@ -133,6 +133,60 @@ using namespace metal;
   y[size_t(c) * dims.x + o] = acc + (b ? b[o] : 0.f);
 }
 
+// tts_gemv12's 2D-tiled form (the <10 ms fusion's go/no-go kernel): one 128-thread threadgroup
+// computes a 16-output x 12-slot block. Each 64-wide K chunk's 16 W rows are loaded ONCE into
+// threadgroup memory and shared by the 12 slots (12x less W traffic than gemv12's per-slot
+// re-reads of the same rows), and the chunk is co-reduced across 8 K lanes before it folds
+// into the per-output accumulator. dims = (out, in); grid = out/16 threadgroups, 128 threads.
+// Static threadgroup memory is 12,032 B (the MTL layer's double-count stays under the 32,768
+// B cap); ragged tiles (out/in not multiples of 16/64) zero-pad in the guards.
+[[kernel]] void tts_gemv12_t(const device bfloat* w [[buffer(0)]], const device float* x [[buffer(1)]],
+                             const device float* b [[buffer(2)]], device float* y [[buffer(3)]],
+                             constant uint2& dims [[buffer(4)]],
+                             uint g [[threadgroup_position_in_grid]],
+                             uint tid [[thread_position_in_threadgroup]]) {
+  const uint out = dims.x, in = dims.y;
+  const uint TM = 16, TK = 64, KL = 8;
+  const uint o0 = g * TM;
+  threadgroup bfloat wt[TM * TK];
+  threadgroup float xt[12 * TK];
+  threadgroup float rt[12 * TM * KL];
+  threadgroup float yt[12 * TM];
+  for (uint i = tid; i < 12u * TM; i += 128u) yt[i] = 0.f;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint oi = tid / KL, kl = tid % KL;
+  for (uint ck = 0; ck * TK < in; ++ck) {
+    const uint k0 = ck * TK;
+    for (uint i = tid; i < TM * TK; i += 128u) {
+      const uint o = o0 + i / TK, k = k0 + i % TK;
+      wt[i] = (o < out && k < in) ? w[size_t(o) * in + k] : bfloat(0);
+    }
+    for (uint i = tid; i < 12u * TK; i += 128u) {
+      const uint c = i / TK, k = k0 + i % TK;
+      xt[i] = (k < in) ? x[size_t(c) * in + k] : 0.f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // this thread's K sub-chunk (8 of the 64) partial-accumulated per slot, staged for the reduce
+    for (uint c = 0; c < 12; ++c) {
+      float s = 0;
+      for (uint j = 0; j < KL; ++j) s += float(wt[oi * TK + kl * KL + j]) * xt[c * TK + kl * KL + j];
+      rt[(size_t(c) * TM + oi) * KL + kl] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (kl == 0u)
+      for (uint c = 0; c < 12; ++c) {
+        float s = 0;
+        for (uint j = 0; j < KL; ++j) s += rt[(size_t(c) * TM + oi) * KL + j];
+        yt[c * TM + oi] += s;
+      }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint i = tid; i < 12u * TM; i += 128u) {
+    const uint c = i / TM, o = o0 + i % TM;
+    if (o < out) y[size_t(c) * out + o] = yt[i] + (b ? b[o] : 0.f);
+  }
+}
+
 // ---- the MaskGIT reveal on the GPU (one readout per frame instead of one per pass; the CPU
 // sampler in sample_frame is the oracle) ----
 

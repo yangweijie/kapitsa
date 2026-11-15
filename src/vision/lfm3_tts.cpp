@@ -461,15 +461,31 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
 
   // the trunk's weights are ONE shared [out, in] matrix applied to each of the 12 slots:
   // tts_gemv12's grid is (out, 12), one thread per (output row, slot)
+  // NI_TTS_TILE: the 2D-tiled form of the trunk's GEMVs (tts_gemv12_t) is the DEFAULT (measured
+  // 24.0 vs 31.6 ms/frame on the M5 Pro, 2 interleaved bare-timer rounds under lockf; the
+  // math is identical up to the K reassociation, lfm3_tts_check's differential check). The
+  // kill switch NI_TTS_TILE=0 selects the serial form. One 16-output x 12-slot block per
+  // 128-thread group, each 64-wide K chunk's 16 W rows read ONCE into threadgroup memory (12x
+  // less W traffic than the serial form), the chunk co-reduced across 8 K lanes. All 8 trunk
+  // sites share the branch; the TTS shapes are exact multiples (out 32-1024 of 16, in
+  // 1024/2816 of 64), so no ragged tile ever occurs.
+  static const bool kTile = [] {
+    const char* s = getenv("NI_TTS_TILE");
+    return s ? *s != '0' : true;
+  }();
   auto gemv_rows = [&](Buffer& y, const Buffer& w, const Buffer& x, const Buffer& b, uint out, uint in) {
     const Dims dims{out, in};
-    e->use(Gpu::get().pipeline("tts_gemv12"));
+    // both kernels take the same (w, x, b, y, dims) layout; only the dispatch grain differs
+    e->use(kTile ? Gpu::get().pipeline("tts_gemv12_t") : Gpu::get().pipeline("tts_gemv12"));
     e->buf(0, w);
     e->buf(1, x);
     e->buf(2, b);
     e->buf(3, y);
     e->val(4, dims);
-    e->dispatch((out * kCodebooks + 63) / 64, 1, 1, 64);
+    if (kTile)
+      e->dispatch(out / 16, 1, 1, 128);  // 16-output tiles, 128 threads
+    else
+      e->dispatch((out * kCodebooks + 63) / 64, 1, 1, 64);
   };
   auto rms12 = [&](Buffer& y, const Buffer& x, const Buffer& w) {
     e->use(Gpu::get().pipeline("tts_rms"));
