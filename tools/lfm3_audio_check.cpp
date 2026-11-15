@@ -3,10 +3,12 @@
 // lfm3_audio_ref_test), the downsampler's output, the encoder blocks' per-layer hidden states,
 // and the projector's output. Reads the reference's .npy files directly (the v2 header, fp32).
 //
-//   lfm3_audio_check CLIP.wav REFDIR [MODELDIR]
+//   lfm3_audio_check CLIP.wav REFDIR [MODELDIR] [--gpu]
 //
 // MODELDIR defaults to .lfm3-real/home/models/lfm3-omni-2b (the imported Omni, whose folder
-// carries audio.safetensors + audio_config.json from the mmproj --audio import).
+// carries audio.safetensors + audio_config.json from the mmproj --audio import). --gpu runs the
+// downsampler's Metal path (src/kernels/audio.metal) against the CPU oracle; it needs the GPU
+// lock, run it under `lockf -k /tmp/kapitsa-gpu.lock`.
 #include "vision/lfm3_audio.h"
 
 #include <cmath>
@@ -101,12 +103,21 @@ double compare(const std::vector<float>& got, const std::vector<float>& ref, con
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 3) {
-    fprintf(stderr, "usage: lfm3_audio_check CLIP.wav REFDIR [MODELDIR]\n");
+  bool gpu_mode = false;
+  std::vector<std::string> pos;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--gpu")
+      gpu_mode = true;
+    else
+      pos.push_back(a);
+  }
+  if (pos.size() < 2) {
+    fprintf(stderr, "usage: lfm3_audio_check CLIP.wav REFDIR [MODELDIR] [--gpu]\n");
     return 2;
   }
-  const std::string clip = argv[1], refdir = argv[2];
-  const std::string dir = argc > 3 ? argv[3] : ".lfm3-real/home/models/lfm3-omni-2b";
+  const std::string clip = pos[0], refdir = pos[1];
+  const std::string dir = pos.size() > 2 ? pos[2] : ".lfm3-real/home/models/lfm3-omni-2b";
   ni::audio::AudioConfig c;
   if (!ni::audio::Lfm3Audio::supports(dir, &c)) {
     fprintf(stderr, "no audio tower in %s\n", dir.c_str());
@@ -133,19 +144,61 @@ int main(int argc, char** argv) {
     // down.npy holds the ENCODER's last hidden state — ref_audio.py dumps enc(...)'s return.
     std::vector<int64_t> sh;
     const auto ds_ref = read_npy(refdir + "/ref_ds.npy", sh);  // [1, tokens, hidden] batch-major
-    if (int64_t(p.tokens) != sh[sh.size() - 2]) {
+    const bool ref_match = int64_t(p.tokens) == sh[sh.size() - 2];
+    if (!ref_match && !gpu_mode) {
       fprintf(stderr, "token count %d vs ref %lld\n", p.tokens, (long long)sh[0]);
       return 1;
     }
-    const auto ds_got = tower.dbg_downsample(p);
-    compare(ds_got, ds_ref, "ds");
-    { FILE* g = fopen("/tmp/cpp_ds.bin", "wb"); fwrite(ds_got.data(), 4, ds_got.size(), g); fclose(g); }
-    const auto ref = read_npy(refdir + "/down.npy", sh);
-    const auto got = tower.dbg_encode(p);
-    fprintf(stderr, "encode done, %zu rows (%.0f ms incl load)\n", got.size(), ms(t1, std::chrono::steady_clock::now()));
-    const double cos = compare(got, ref, "enc");
-    { FILE* g = fopen("/tmp/cpp_enc.bin", "wb"); fwrite(got.data(), 4, got.size(), g); fclose(g); }
-    if (cos < 0.999) fprintf(stderr, "ENC below 0.999\n");
+    if (!ref_match) {
+      // a --gpu run on a clip the ref dump was not made for: the check is the GPU's agreement
+      // with the CPU oracle (below), the reference comparisons stay out of it
+      fprintf(stderr, "ref dump is for a different clip (%d tokens); --gpu checks the CPU oracle only\n",
+              p.tokens);
+    }
+    if (ref_match) {
+      const auto ds_got = tower.dbg_downsample(p);
+      compare(ds_got, ds_ref, "ds");
+      { FILE* g = fopen("/tmp/cpp_ds.bin", "wb"); fwrite(ds_got.data(), 4, ds_got.size(), g); fclose(g); }
+      const auto ref = read_npy(refdir + "/down.npy", sh);
+      const auto got = tower.dbg_encode(p);
+      fprintf(stderr, "encode done, %zu rows (%.0f ms incl load)\n", got.size(),
+              ms(t1, std::chrono::steady_clock::now()));
+      const double cos = compare(got, ref, "enc");
+      { FILE* g = fopen("/tmp/cpp_enc.bin", "wb"); fwrite(got.data(), 4, got.size(), g); fclose(g); }
+      if (cos < 0.999) fprintf(stderr, "ENC below 0.999\n");
+    }
+  }
+  if (gpu_mode) {
+    // the Metal downsampler vs the CPU oracle (both read the same bf16 checkpoint weights; the
+    // band is the fp32-sum + fast::exp drift, ~1e-4 relative on O(1) activations). The reference
+    // .npy comparisons above already hold the CPU side, so the GPU's agreement with it is the
+    // GPU-vs-CPU check.
+    tower.load();
+    const auto ds_cpu = tower.dbg_downsample(p);
+    auto t3c = std::chrono::steady_clock::now();
+    const auto ds_gpu = tower.dbg_downsample_gpu(p);
+    auto t4c = std::chrono::steady_clock::now();
+    if (ds_gpu.size() != ds_cpu.size()) {
+      fprintf(stderr, "gpu ds: size %zu vs cpu %zu\n", ds_gpu.size(), ds_cpu.size());
+      return 1;
+    }
+    double num = 0, da = 0, db = 0, mx = 0;
+    for (size_t i = 0; i < ds_gpu.size(); ++i) {
+      const double d = double(ds_gpu[i]) - double(ds_cpu[i]);
+      num += d * d;
+      da += double(ds_gpu[i]) * double(ds_gpu[i]);
+      db += double(ds_cpu[i]) * double(ds_cpu[i]);
+      mx = std::max(mx, std::abs(d));
+    }
+    const double cos = da * db == 0 ? 1.0 : (da + db - num) / (2.0 * std::sqrt(da * db));
+    fprintf(stderr, "gpu ds: cosine vs cpu %.7f  max|d| %.6g  (%.0f ms incl load)\n", cos, mx,
+            ms(t3c, t4c));
+    if (cos < 0.99995 || mx > 1e-2) {
+      fprintf(stderr, "gpu ds outside the fp32 band (cos > 0.99995, max|d| < 1e-2)\n");
+      return 1;
+    }
+    fprintf(stderr, "ok gpu ds (the downsampler's Metal path matches the CPU oracle)\n");
+    return 0;
   }
   tower.load();
   {

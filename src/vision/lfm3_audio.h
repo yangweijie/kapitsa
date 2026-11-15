@@ -3,8 +3,9 @@
 // attention with SWA 32, no per-head gate) and the LayerNorm->768->2048 GELU->2048 projector.
 // Weights bf16 in the co-located audio.safetensors (the mmproj import's --audio). The spec and
 // the CPU references live in lfm3_audio_ref.h; the reference feature check is ref_audio.py.
-// v1 runs the whole tower on the CPU (correctness first, ~seconds for a 10 s clip); Metal
-// kernels are the follow-up perf commit. See findings.md Session 19 for the design notes.
+// v1 runs the whole tower on the CPU (correctness first, ~seconds for a 10 s clip); the
+// downsampler has a Metal path (dbg_downsample_gpu, src/kernels/audio.metal), the 17-block
+// encoder + projector follow. See findings.md Session 19 for the design notes.
 #pragma once
 #include "metal/gpu.h"
 
@@ -76,10 +77,17 @@ class Lfm3Audio {
 
   // test hooks: the stage activations in fp32 (the reference dump's comparisons)
   std::vector<float> dbg_encode(const AudioPrepared& p) const;
+  // the downsampler's GPU path (src/kernels/audio.metal): the same [tokens, hidden] fp32, the
+  // CPU forward is the oracle. Uploads the checkpoint's bf16 weights + the mel on first use.
+  std::vector<float> dbg_downsample_gpu(const AudioPrepared& p) const;
 
  private:
   std::vector<float> downsample(const float* mel, int frames) const;  // [tokens, hidden] fp32
   void blocks(const float* x, int T, float* out) const;               // 17 layers, fp32 [T, hidden]
+  void load_gpu();
+  struct GpuWeights;
+  std::unique_ptr<GpuWeights> gw_;
+  bool gpu_ready_ = false;
   std::string dir_;
   AudioConfig c_;
   struct Weights;

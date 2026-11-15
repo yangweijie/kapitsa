@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 
 namespace ni::audio {
@@ -26,7 +27,7 @@ using json = nlohmann::json;
 namespace {
 
 inline float bf16_to_f32(uint16_t v) {
-  uint32_t u = uint32_t(v) << 16;
+  uint32_t u = std::uint32_t(v) << 16;
   float f;
   memcpy(&f, &u, 4);
   return f;
@@ -430,6 +431,131 @@ std::vector<float> Lfm3Audio::downsample(const float* mel, int frames) const {
 std::vector<float> Lfm3Audio::dbg_downsample(const AudioPrepared& p) const {
   if (!loaded_) const_cast<Lfm3Audio*>(this)->load();
   return downsample(p.mel.data(), p.frames);
+}
+
+// ---- the GPU path (src/kernels/audio.metal; the CPU forward above is the oracle) ----
+
+struct Lfm3Audio::GpuWeights {
+  Buffer ci_w, ci_b, cm_w, cm_b, ce_w, ce_b;  // the depthwise k3 convs [C, 9] + biases [C] (bf16)
+  Buffer lm_w, lm_b, le_w, le_b;               // the 1x1 mixes [C, C] + [C]
+  Buffer lo_w, lo_b;                           // lin_out [H, FM] + [H]
+};
+
+namespace {
+struct Adims { std::uint32_t a, b, c, d; };  // audio.metal's Ds
+struct A2 { std::uint32_t x, y; };            // audio.metal's uint2
+}  // namespace
+
+void Lfm3Audio::load_gpu() {
+  if (gpu_ready_) return;
+  if (!loaded_) load();
+  gw_ = std::make_unique<GpuWeights>();
+  GpuWeights& G = *gw_;
+  auto up = [](Buffer& dst, const std::vector<uint16_t>& src, const char* label) {
+    dst = Gpu::get().alloc(src.size() * 2 + 16, label);
+    memcpy(dst.ptr(), src.data(), src.size() * 2);
+  };
+  const Weights& W = *w_;
+  up(G.ci_w, W.ci_w, "ad_w");
+  up(G.ci_b, W.ci_b, "ad_b");
+  up(G.cm_w, W.cm_w, "ad_w");
+  up(G.cm_b, W.cm_b, "ad_b");
+  up(G.ce_w, W.ce_w, "ad_w");
+  up(G.ce_b, W.ce_b, "ad_b");
+  up(G.lm_w, W.lm_w, "ad_w");
+  up(G.lm_b, W.lm_b, "ad_b");
+  up(G.le_w, W.le_w, "ad_w");
+  up(G.le_b, W.le_b, "ad_b");
+  up(G.lo_w, W.lo_w, "ad_w");
+  up(G.lo_b, W.lo_b, "ad_b");
+  gpu_ready_ = true;
+}
+
+std::vector<float> Lfm3Audio::dbg_downsample_gpu(const AudioPrepared& p) const {
+  Lfm3Audio* self = const_cast<Lfm3Audio*>(this);
+  if (!gpu_ready_) self->load_gpu();
+  const GpuWeights& G = *gw_;
+  const int M = c_.mel_bins, C = c_.conv_channels, H = c_.hidden;
+  const int t1 = (p.frames + 1) / 2, m1 = (M + 1) / 2;
+  const int t2 = (t1 + 1) / 2, m2 = (m1 + 1) / 2;
+  const int t3 = (t2 + 1) / 2, m3 = (m2 + 1) / 2;
+  const size_t n1 = size_t(t1) * m1 * C, n2 = size_t(t2) * m2 * C, n3 = size_t(t3) * m3 * C;
+  Gpu& gpu = Gpu::get();
+  const Buffer mel = gpu.alloc(p.mel.size() * 4 + 16, "ad_mel");
+  memcpy(mel.ptr(), p.mel.data(), p.mel.size() * 4);
+  const Buffer s1 = gpu.alloc(n1 * 4 + 16, "ad_s1");
+  const Buffer s2 = gpu.alloc(n2 * 4 + 16, "ad_s2");
+  const Buffer s2o = gpu.alloc(n2 * 4 + 16, "ad_s2o");
+  const Buffer s3 = gpu.alloc(n3 * 4 + 16, "ad_s3");
+  const Buffer s3o = gpu.alloc(n3 * 4 + 16, "ad_s3o");
+  const Buffer outb = gpu.alloc(size_t(t3) * H * 4 + 16, "ad_out");
+  auto e = gpu.begin();
+  {  // stage 1: conv_in over the raw mel (its 1x1 is the identity, the SiLU is fused)
+    const Adims g{std::uint32_t(p.frames), std::uint32_t(M), std::uint32_t(C), std::uint32_t(t1)};
+    e->use(gpu.pipeline("audio_ds_conv"));
+    e->buf(0, mel);
+    e->buf(1, G.ci_w);
+    e->buf(2, G.ci_b);
+    e->buf(3, s1);
+    e->val(4, g);
+    e->dispatch((n1 + 255) / 256, 1, 1, 256);  // group count, not thread count
+  }
+  // the 1x1 mix needs a separate out buffer: each thread reads its whole row before writing
+  // one of its slots, so an in-place dispatch would race (the CPU stage keeps the conv and the
+  // mix apart for the same reason).
+  {  // stage 2: conv_mid + lin_mid
+    const Adims g{std::uint32_t(t1), std::uint32_t(m1), std::uint32_t(C), std::uint32_t(t2)};
+    e->use(gpu.pipeline("audio_ds_conv2"));
+    e->buf(0, s1);
+    e->buf(1, G.cm_w);
+    e->buf(2, G.cm_b);
+    e->buf(3, s2);
+    e->val(4, g);
+    e->dispatch((n2 + 255) / 256, 1, 1, 256);
+    const A2 dims{std::uint32_t(t2 * m2), std::uint32_t(C)};
+    e->use(gpu.pipeline("audio_ds_lin"));
+    e->buf(0, s2);
+    e->buf(1, G.lm_w);
+    e->buf(2, G.lm_b);
+    e->buf(3, s2o);
+    e->val(4, dims);
+    e->dispatch((n2 + 255) / 256, 1, 1, 256);
+  }
+  {  // stage 3: conv_end + lin_end
+    const Adims g{std::uint32_t(t2), std::uint32_t(m2), std::uint32_t(C), std::uint32_t(t3)};
+    e->use(gpu.pipeline("audio_ds_conv2"));
+    e->buf(0, s2o);
+    e->buf(1, G.ce_w);
+    e->buf(2, G.ce_b);
+    e->buf(3, s3);
+    e->val(4, g);
+    e->dispatch((n3 + 255) / 256, 1, 1, 256);
+    const A2 dims{std::uint32_t(t3 * m3), std::uint32_t(C)};
+    e->use(gpu.pipeline("audio_ds_lin"));
+    e->buf(0, s3);
+    e->buf(1, G.le_w);
+    e->buf(2, G.le_b);
+    e->buf(3, s3o);
+    e->val(4, dims);
+    e->dispatch((n3 + 255) / 256, 1, 1, 256);
+  }
+  {  // lin_out: each token's channel-major (mel, C) flatten GEMV'd to the hidden width
+    const A2 dims{std::uint32_t(H), std::uint32_t(t3)};
+    const A2 sh{std::uint32_t(m3), std::uint32_t(C)};
+    e->use(gpu.pipeline("audio_ds_out"));
+    e->buf(0, G.lo_w);
+    e->buf(1, s3o);
+    e->buf(2, G.lo_b);
+    e->buf(3, outb);
+    e->val(4, dims);
+    e->val(5, sh);
+    e->dispatch((size_t(t3) * H + 255) / 256, 1, 1, 256);
+  }
+  e->commit();
+  e->wait();
+  std::vector<float> out(size_t(t3) * H);
+  memcpy(out.data(), outb.ptr(), out.size() * 4);
+  return out;
 }
 
 // test hook: the tower's blocks + final norm (fp32), the "down.npy" stage of the reference dump
