@@ -244,3 +244,61 @@ struct Ds {
   if (id >= n) return;
   a[id] = silu(a[id]) * b[id];
 }
+
+// ---- the projector (LayerNorm -> L1 -> tanh-GELU -> L2 -> bf16; the CPU's encode() is the
+// oracle) ----
+
+// per-row LayerNorm (the mean/var form, the CPU's fp32 sums + the fp32 sqrt): one threadgroup
+// per row, the two sums reduced in the scratch (mean at [0..31], the squares at [32..63]).
+[[kernel]] void audio_proj_ln(const device float* x [[buffer(0)]], const device float* w [[buffer(1)]],
+                              const device float* b [[buffer(2)]], device float* out [[buffer(3)]],
+                              constant uint2& dims [[buffer(4)]],  // (T, dim)
+                              constant float& eps [[buffer(5)]],
+                              uint r [[threadgroup_position_in_grid]],
+                              uint j [[thread_position_in_threadgroup]],
+                              uint jn [[threads_per_threadgroup]]) {
+  threadgroup float scratch[64];
+  const device float* xr = x + size_t(r) * dims.y;
+  float s1 = 0, s2 = 0;
+  for (uint i = j; i < dims.y; i += jn) {
+    s1 += xr[i];
+    s2 += xr[i] * xr[i];
+  }
+  const float mean = tg_sum(s1, scratch, j, jn) / float(dims.y);
+  const float var = tg_sum(s2, scratch + 32, j, jn) / float(dims.y);
+  const float rstd = 1.0f / metal::sqrt(metal::max(var - mean * mean, 0.0f) + eps);
+  for (uint i = j; i < dims.y; i += jn)
+    out[size_t(r) * dims.y + i] = w[i] * (xr[i] - mean) * rstd + b[i];
+}
+
+// batched GEMM with the fp32 bias: y[r, o] = b[o] + sum_j W[o, in] * x[r, j].
+[[kernel]] void audio_gemm_b(const device bfloat* w [[buffer(0)]], const device float* x [[buffer(1)]],
+                             const device float* b [[buffer(2)]], device float* y [[buffer(3)]],
+                             constant uint3& dims [[buffer(4)]],  // (R, O, in)
+                             uint id [[thread_position_in_grid]]) {
+  if (id >= dims.x * dims.y) return;
+  const uint o = id % dims.y, r = id / dims.y;
+  float acc = float(b[o]);
+  const device bfloat* row = w + size_t(o) * dims.z;
+  const device float* xr = x + size_t(r) * dims.z;
+  for (uint j = 0; j < dims.z; ++j) acc += float(row[j]) * xr[j];
+  y[id] = acc;
+}
+
+// the projector's GELU (HF's tanh form: 0.5 x (1 + tanh(0.79788456 (x + 0.044715 x^3)))).
+[[kernel]] void audio_gelu(device float* y [[buffer(0)]], constant uint& n [[buffer(1)]],
+                           uint id [[thread_position_in_grid]]) {
+  if (id >= n) return;
+  const float v = y[id], x3 = v * v * v;
+  y[id] = 0.5f * v * (1.0f + metal::tanh(0.7978845608028654f * (v + 0.044715f * x3)));
+}
+
+// the bf16 cast (the encode()'s output rows: fp32 -> the checkpoint's bf16, round-half-even,
+// the CPU's (u + 0x7FFF + ((u >> 16) & 1)) >> 16).
+[[kernel]] void audio_f2bf(const device float* x [[buffer(0)]], device ushort* out [[buffer(1)]],
+                           constant uint& n [[buffer(2)]], uint id [[thread_position_in_grid]]) {
+  if (id >= n) return;
+  union { float f; uint u; } cv;
+  cv.f = x[id];
+  out[id] = ushort((cv.u + 0x7FFFu + ((cv.u >> 16) & 1u)) >> 16);
+}

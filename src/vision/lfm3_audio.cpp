@@ -1,10 +1,11 @@
-// The LFM3-Omni audio INPUT encoder, v1 CPU (see lfm3_audio.h). The math follows the HF
+// The LFM3-Omni audio INPUT encoder (see lfm3_audio.h). The math follows the HF
 // reference as pinned in lfm3_audio_ref.h: mel front end, downsampler (3 k3-s2 convs + SiLU +
 // 1x1, 8 frames -> 1 token), 17 blocks (the text tower's math at width 768 — k=3 gated short
 // convs, HD-96 full-rope attention with SWA 32, NO per-head gate), final RMSNorm, and the
 // LayerNorm->768->2048 GELU->2048 projector. Weights bf16 from the co-located audio.safetensors
-// (the mmproj import's --audio). v1 runs the whole tower on the CPU (correctness first; Metal
-// kernels are the follow-up perf commit).
+// (the mmproj import's --audio). The CPU forward is the oracle for the Metal path
+// (encode_gpu, src/kernels/audio.metal: the whole tower as kernels), which the engine does not
+// use yet — it is the follow-up perf wiring, and the check is lfm3_audio_check --gpu.
 #include "vision/lfm3_audio.h"
 
 #include "util/log.h"
@@ -450,6 +451,8 @@ struct Lfm3Audio::GpuWeights {
   };
   std::vector<BLK> blocks;
   Buffer final_norm;  // the embedding norm [H] (fp32)
+  // the projector: LayerNorm (fp32 w/b) -> L1 (bf16) -> GELU -> L2 (bf16) -> bf16 rows
+  Buffer plnw, plnb, l1w, l1b, l2w, l2b;
 };
 
 namespace {
@@ -506,6 +509,12 @@ void Lfm3Audio::load_gpu() {
     up(GB.w3, B.w3, "ad_w");
   }
   upf(G.final_norm, W.final_norm, "ad_nw");
+  upf(G.plnw, W.plnw, "ad_nw");
+  upf(G.plnb, W.plnb, "ad_nw");
+  up(G.l1w, W.l1w, "ad_w");
+  upf(G.l1b, W.l1b, "ad_b");
+  up(G.l2w, W.l2w, "ad_w");
+  upf(G.l2b, W.l2b, "ad_b");
   gpu_ready_ = true;
 }
 
@@ -727,6 +736,73 @@ std::vector<float> Lfm3Audio::dbg_encode_gpu(const AudioPrepared& p) const {
   std::vector<float> out(size_t(T) * H);
   memcpy(out.data(), outb.ptr(), out.size() * 4);
   return out;
+}
+
+// the full tower on the GPU: the downsample + the blocks (dbg_encode_gpu) + the projector
+// (LayerNorm -> L1 -> GELU -> L2 -> the bf16 rows), the CPU's encode() is the oracle.
+Buffer Lfm3Audio::encode_gpu(const AudioPrepared& p) const {
+  Lfm3Audio* self = const_cast<Lfm3Audio*>(this);
+  if (!gpu_ready_) self->load_gpu();
+  if (p.tokens <= 0) return Buffer{};
+  if (c_.head_dim != 96 || c_.sliding_window != 32 || c_.conv_kernel != 3 ||
+      c_.heads % c_.kv_heads != 0)
+    return self->encode(p);
+  const GpuWeights& G = *gw_;
+  const int T = p.tokens, H = c_.hidden, O = c_.out_hidden;
+  Gpu& gpu = Gpu::get();
+  const std::vector<float> enc = dbg_encode_gpu(p);
+  const Buffer xb = gpu.alloc(enc.size() * 4 + 16, "ae_enc");
+  memcpy(xb.ptr(), enc.data(), enc.size() * 4);
+  const Buffer nrm = gpu.alloc(size_t(T) * H * 4 + 16, "ae_nrm");
+  const Buffer y1 = gpu.alloc(size_t(T) * O * 4 + 16, "ae_y1");
+  const Buffer y2 = gpu.alloc(size_t(T) * O * 4 + 16, "ae_y2");
+  const Buffer ob = gpu.alloc(size_t(T) * O * 2 + 16, "ae_emb");
+  auto e = gpu.begin();
+  {  // the projector's LayerNorm (the fp32 sums, the CPU's mean/var form)
+    const A2 d{std::uint32_t(T), std::uint32_t(H)};
+    e->use(gpu.pipeline("audio_proj_ln"));
+    e->buf(0, xb);
+    e->buf(1, G.plnw);
+    e->buf(2, G.plnb);
+    e->buf(3, nrm);
+    e->val(4, d);
+    e->val(5, float(c_.proj_ln_eps));
+    e->dispatch(std::uint32_t(T), 1, 1, 128);
+  }
+  {  // L1 + the tanh-GELU
+    const A3 d{std::uint32_t(T), std::uint32_t(O), std::uint32_t(H)};
+    e->use(gpu.pipeline("audio_gemm_b"));
+    e->buf(0, G.l1w);
+    e->buf(1, nrm);
+    e->buf(2, G.l1b);
+    e->buf(3, y1);
+    e->val(4, d);
+    e->dispatch((size_t(T) * O + 255) / 256, 1, 1, 256);
+    const std::uint32_t n = std::uint32_t(size_t(T) * O);
+    e->use(gpu.pipeline("audio_gelu"));
+    e->buf(0, y1);
+    e->val(1, n);
+    e->dispatch((size_t(T) * O + 255) / 256, 1, 1, 256);
+  }
+  {  // L2 + the bf16 rows
+    const A3 d{std::uint32_t(T), std::uint32_t(O), std::uint32_t(O)};
+    e->use(gpu.pipeline("audio_gemm_b"));
+    e->buf(0, G.l2w);
+    e->buf(1, y1);
+    e->buf(2, G.l2b);
+    e->buf(3, y2);
+    e->val(4, d);
+    e->dispatch((size_t(T) * O + 255) / 256, 1, 1, 256);
+    const std::uint32_t n = std::uint32_t(size_t(T) * O);
+    e->use(gpu.pipeline("audio_f2bf"));
+    e->buf(0, y2);
+    e->buf(1, ob);
+    e->val(2, n);
+    e->dispatch((n + 255) / 256, 1, 1, 256);
+  }
+  e->commit();
+  e->wait();
+  return ob;
 }
 
 // test hook: the tower's blocks + final norm (fp32), the "down.npy" stage of the reference dump

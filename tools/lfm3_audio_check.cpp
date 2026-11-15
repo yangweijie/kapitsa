@@ -222,6 +222,37 @@ int main(int argc, char** argv) {
       return 1;
     }
     fprintf(stderr, "ok gpu enc (the encoder blocks' Metal path matches the CPU oracle)\n");
+    // the projector: the full tower's GPU output (the bf16 rows) vs the CPU's encode()
+    const ni::Buffer emb_gpu = tower.encode_gpu(p);
+    const ni::Buffer emb_cpu = tower.encode(p);
+    if (emb_gpu.ptr() == nullptr || emb_cpu.ptr() == nullptr) {
+      fprintf(stderr, "gpu proj: a null encode()\n");
+      return 1;
+    }
+    const size_t nbf = size_t(p.tokens) * size_t(tower.out_dim());
+    std::vector<float> p_gpu(nbf), p_cpu(nbf);
+    const uint16_t* hg = reinterpret_cast<const uint16_t*>(emb_gpu.ptr());
+    const uint16_t* hc = reinterpret_cast<const uint16_t*>(emb_cpu.ptr());
+    for (size_t i = 0; i < nbf; ++i) {
+      uint32_t ug = uint32_t(hg[i]) << 16, uc = uint32_t(hc[i]) << 16;
+      memcpy(&p_gpu[i], &ug, 4);
+      memcpy(&p_cpu[i], &uc, 4);
+    }
+    num = 0, da = 0, db = 0, mx = 0;
+    for (size_t i = 0; i < nbf; ++i) {
+      const double d = double(p_gpu[i]) - double(p_cpu[i]);
+      num += d * d;
+      da += double(p_gpu[i]) * double(p_gpu[i]);
+      db += double(p_cpu[i]) * double(p_cpu[i]);
+      mx = std::max(mx, std::abs(d));
+    }
+    const double pcos = da * db == 0 ? 1.0 : (da + db - num) / (2.0 * std::sqrt(da * db));
+    fprintf(stderr, "gpu proj: cosine vs cpu %.7f  max|d| %.6g\n", pcos, mx);
+    if (pcos < 0.999 || mx > 5e-2) {
+      fprintf(stderr, "gpu proj outside the fp32 band (cos > 0.999, max|d| < 5e-2)\n");
+      return 1;
+    }
+    fprintf(stderr, "ok gpu proj (the projector's Metal path matches the CPU oracle)\n");
     return 0;
   }
   tower.load();
