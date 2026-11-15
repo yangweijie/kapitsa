@@ -99,7 +99,7 @@ using namespace metal;
       }
       out[size_t(c) * 1024u + size_t(h) * hd + d] = o * g;
     }
-    
+
   }
 }
 
