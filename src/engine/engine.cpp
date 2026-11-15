@@ -4493,6 +4493,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         wav.push_back(char(v & 0xFF));
         wav.push_back(char((v >> 8) & 0xFF));
       };
+      push(uint32_t(36 + n * 2));  // RIFF chunk size: the header + the PCM data
       wav += "WAVEfmt ";
       push(16);
       push16(1);
