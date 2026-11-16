@@ -3483,9 +3483,16 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         res.error = "tts: the speech side did not load";
         return false;
       }
-      const bool end_of_audio = std::all_of(frame.begin(), frame.end(),
+      // The reference's stop: ONE codebook sampling the EOS code ends the speech (the generate
+      // loop's is_eos branch, modeling_lfm3_omni.py: replaces the whole frame with the EOS code
+      // and switches to text mode, and the frame itself is not returned). Requiring ALL codebooks
+      // made the reply wait for a frame that mostly never comes — and the partial-EOS frames it
+      // spoke meanwhile reach the codec, whose EOS-codebook rows decode to the silent/garbled
+      // stretches mid-clip (the stutter: 3 silent runs inside the 48-frame clip vs 1 in the
+      // reference's 34).
+      const bool end_of_audio = std::any_of(frame.begin(), frame.end(),
                                             [eos = model_->audio_eos_code()](int v) { return v == eos; });
-      speech_frames.push_back(std::move(frame));
+      if (!end_of_audio) speech_frames.push_back(std::move(frame));
       // the audio_out token drops from the text reply; the length cap counts it like any token
       // (without this the speech loop never stops when the model emits no eos frame)
       if (finish.empty() && gen >= r.max_tokens) finish = "length";
@@ -4488,6 +4495,16 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   res.decode_ms = now_ms() - t1;
   if (!speech_frames.empty()) {
     res.audio_frames = std::move(speech_frames);
+    if (const char* cf = getenv("NI_TTS_CODES")) {  // dump the frame codes (per-frame codebooks) for the choppiness bisect
+      std::ofstream co(cf, std::ios::binary);
+      uint32_t nf = uint32_t(res.audio_frames.size());
+      co.write(reinterpret_cast<const char*>(&nf), 4);
+      for (const auto& fr : res.audio_frames) {
+        int32_t n = int32_t(fr.size());
+        co.write(reinterpret_cast<const char*>(&n), 4);
+        for (int c : fr) co.write(reinterpret_cast<const char*>(&c), 4);
+      }
+    }
     auto samples = model_->decode_speech(res.audio_frames);
     if (!samples.empty()) {
       std::string wav = "RIFF";
