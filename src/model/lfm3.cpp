@@ -522,6 +522,10 @@ std::vector<int> Lfm3::speech_frame(uint64_t seed) {
   // final norm), so read it.
   std::vector<float> hidden(size_t(cfg_.hidden));
   memcpy(hidden.data(), xn_.as<float>(), hidden.size() * 4);
+  if (const char* hd = getenv("NI_TTS_HIDDEN")) {  // a per-frame dump of the depth decoder's input
+    static FILE* hf = fopen(hd, "wb");
+    if (hf) fwrite(hidden.data(), 4, hidden.size(), hf);
+  }
   // the audio repetition penalty: the per-codebook codes this reply emitted in the last
   // audio_rep_window_ frames (rep_hist_), fed to the sampler. Empty when the window is 0, so the
   // default (no penalty / no window) keeps the pre-wiring behaviour byte-identical.
@@ -1059,6 +1063,21 @@ void Lfm3::encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingPar
     lin(e, L.w2, phh_, pmix_, T, false, 0);
     res_norm(e, pmix_, L.post_ffn_norm, px_, px_, T);
     if (xprobe) xcopy(l + 1);
+  }
+  // NI_LFM3_PLAYER: a per-layer dump of the residual's last row (xprobe slots 0..layers) to a file.
+  // Needs LFM3_X_PROBE=1 so the slots are captured; used for the layerwise divergence bisect vs HF.
+  if (const char* pl = getenv("NI_LFM3_PLAYER")) {
+    const auto& xp = xprobe_state();
+    if (!xp.empty()) {
+      e.commit_and_wait();  // the xcopy's are async GPU copies; force them before reading xp host-side
+      std::ofstream o(pl, std::ios::binary);
+      uint32_t n = uint32_t(xp.size());
+      o.write(reinterpret_cast<const char*>(&n), 4);
+      for (auto& b : xp) o.write(reinterpret_cast<const char*>(b.as<float>()), size_t(H) * 4);
+      uint32_t ntok = uint32_t(T);
+      o.write(reinterpret_cast<const char*>(&ntok), 4);
+      o.write(reinterpret_cast<const char*>(s.tok.as<int>() + pos0), size_t(T) * 4);  // the prefill token ids
+    }
   }
   if (sample) {
     // the chunk's last row through the final norm and the tied head
