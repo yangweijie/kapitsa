@@ -117,6 +117,24 @@ DepthDecoder::DepthDecoder(const std::string& safetensors) {
     L.w2 = read_tensor(f, p + "feed_forward.w2.weight", data_at, header);
     L.w3 = read_tensor(f, p + "feed_forward.w3.weight", data_at, header);
   }
+  // The LLM's audio_out codebook_embedding (the reference's get_audio_out_embeds source): load it
+  // when the checkpoint carries it, so the LLM can condition on the frame's codes (the TTS fix).
+  if (header.find("model.codebook_embedding.weight") != std::string::npos) {
+    codebook_emb_ = read_tensor(f, "model.codebook_embedding.weight", data_at, header);
+    const size_t rows = size_t(kCodebooks) * kCodebookSize;
+    codebook_hidden_ = (rows && codebook_emb_.size() % rows == 0) ? int(codebook_emb_.size() / rows) : 0;
+  }
+}
+
+const std::vector<float>& DepthDecoder::codebook_sum(const std::vector<int>& codes) const {
+  codebook_sum_cache_.assign(codebook_hidden_, 0.0f);
+  if (codebook_emb_.empty() || codes.size() < size_t(kCodebooks)) return codebook_sum_cache_;
+  for (int i = 0; i < kCodebooks; ++i) {
+    const size_t row = size_t(i) * kCodebookSize + size_t(codes[i]);
+    const float* src = codebook_emb_.data() + row * size_t(codebook_hidden_);
+    for (int h = 0; h < codebook_hidden_; ++h) codebook_sum_cache_[size_t(h)] += src[h];
+  }
+  return codebook_sum_cache_;
 }
 
 void DepthDecoder::forward(const std::vector<float>& hidden, const std::vector<int>& codes,

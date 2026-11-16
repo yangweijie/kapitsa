@@ -465,6 +465,7 @@ int Lfm3::audio_eos_code() const {
 void Lfm3::set_speech_mode(bool on) {
   speech_forced_ = on;
   if (on) rep_hist_.clear();  // a fresh speech reply: the repetition penalty's window starts empty
+  if (on) audio_embed_valid_ = false;  // no previous frame yet: the first audio_out position uses the plain embed
   if (on && !tts_) load_tts();  // the first speech slot's forcing needs the weights in place
 }
 
@@ -502,7 +503,13 @@ std::vector<float> Lfm3::decode_speech(const std::vector<std::vector<int>>& fram
 std::vector<int> Lfm3::speech_frame(uint64_t seed) {
   if (!tts_) load_tts();
   if (!tts_) return {};
-  // the last step's pre-head state (xn_ holds the final-normed hidden the head read) — read back
+  // the depth decoder's input is the language model's state at the position preceding the frame,
+  // POST-final-norm: the reference's generate feeds outputs.last_hidden_state (the text model's
+  // embedding_norm output, modeling_lfm3.py) to sample_audio_frame, and its per-frame inputs carry
+  // the post-RMS-norm signature (norm ~19 over 30 TTS frames, CV 0.118). The pre-norm residual x_
+  // is ~3x smaller on the same context: at that amplitude the depth decoder's codes degenerate to
+  // EOS (4-8 of 12), the muffled high band. xn_ is exactly that post-norm state (encode_step's
+  // final norm), so read it.
   std::vector<float> hidden(size_t(cfg_.hidden));
   memcpy(hidden.data(), xn_.as<float>(), hidden.size() * 4);
   // the audio repetition penalty: the per-codebook codes this reply emitted in the last
@@ -520,6 +527,11 @@ std::vector<int> Lfm3::speech_frame(uint64_t seed) {
       tts_->sample_frame_gpu(hidden, audio_temperature_, seed, cb_hist, audio_rep_penalty_);
   rep_hist_.push_back(frame);
   if (audio_rep_window_ > 0 && rep_hist_.size() > size_t(audio_rep_window_)) rep_hist_.erase(rep_hist_.begin());
+  // the reference's get_audio_out_embeds: the LLM's input at the NEXT audio_out position is this
+  // frame's codebook-sum embedding (the codebooks this frame emitted), so the LLM conditions on
+  // the actual codes rather than a fixed <|audio_out|> row. Empty when the table isn't loaded.
+  audio_embed_host_ = tts_->codebook_sum(frame);
+  audio_embed_valid_ = !audio_embed_host_.empty();
   return frame;
 }
 
@@ -789,7 +801,13 @@ void Lfm3::encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, ui
   const uint32_t H = uint32_t(cfg_.hidden), I = uint32_t(cfg_.ffn);
   const uint32_t QD = uint32_t(cfg_.hq) * uint32_t(cfg_.hd), KD = uint32_t(cfg_.hkv) * uint32_t(cfg_.hd);
   if (pos + 1 > s.cap && !reserve(s, pos + 1)) fatal("context full (%d)", s.cap);
-  embed(e, s.tok, pos, 1, x_);
+  if (audio_embed_valid_ && speech_forced_) {
+    // the reference's get_audio_out_embeds: this audio_out position's input is the previous
+    // frame's codebook-sum embedding (x_'s row 0), not the fixed <|audio_out|> embed row.
+    memcpy(x_.ptr(), audio_embed_host_.data(), size_t(cfg_.hidden) * 4);
+  } else {
+    embed(e, s.tok, pos, 1, x_);
+  }
   // one decode row: a 4-bit group-32 linear runs qmvf on the fp32 x (the norm folded); an 8-bit one
   // keeps to_half + qmr8 (xh_ carries half(norm(x) * in_norm) for it)
   auto mv = [&](const Lfm3Lin& W, const Buffer& xfp, const Tensor* norm, const Buffer& y, uint32_t y_ld) {

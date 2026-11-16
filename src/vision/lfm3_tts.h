@@ -51,6 +51,12 @@ class DepthDecoder {
   // The caller holds the GPU turn. F must be 1 (the decode shape).
   bool gpu_ready() const { return gpu_ready_; }
   void load_gpu();
+
+  // The LLM's audio_out input embedding for a frame (the reference's get_audio_out_embeds): the sum
+  // of the 12 codebook rows of `model.codebook_embedding` ([num_codebooks*codebook_size, text hidden],
+  // row i*codebook_size + codes[i]). Empty when the checkpoint has no codebook_embedding table.
+  const std::vector<float>& codebook_sum(const std::vector<int>& codes) const;
+  bool has_codebook() const { return !codebook_emb_.empty(); }
   std::vector<int> sample_frame_gpu(const std::vector<float>& hidden, float temperature, uint64_t seed,
                                    const std::vector<std::vector<int>>& rep_hist = {},
                                    float rep_penalty = 1.0f);
@@ -80,6 +86,11 @@ class DepthDecoder {
   std::vector<float> depth_w_, depth_b_, mask_embedding_, final_norm_;
   std::vector<Codebook> codebooks_;
   std::vector<Layer> layers_;
+  // The LLM's audio_out codebook_embedding ([num_codebooks*codebook_size, text hidden], the
+  // reference's get_audio_out_embeds source); empty when the checkpoint lacks it.
+  std::vector<float> codebook_emb_;
+  int codebook_hidden_ = 0;  // the text hidden size (2048), from the table's column count
+  mutable std::vector<float> codebook_sum_cache_;  // codebook_sum's return (the last frame's)
   // the GPU side (lazy; the weights' fp32 host copies become bf16 device buffers once)
   struct GpuW {
     Buffer depth_w, depth_b, mask_emb, final_norm;

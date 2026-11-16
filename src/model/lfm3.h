@@ -170,6 +170,10 @@ class Lfm3 : public Model {
   float audio_rep_penalty_ = 1.0f;  // the reference's n_penalty (the audio repetition penalty; 1.0 = none)
   int audio_rep_window_ = 0;         // its n_window (the last n frames' codes per codebook)
   std::vector<std::vector<int>> rep_hist_;  // the reply's per-codebook codes, one row per frame (capped)
+  // The reference's get_audio_out_embeds: the previous frame's codebook-sum embedding, the LLM's
+  // input at the next audio_out position (so the LLM conditions on the actual codes it emitted).
+  std::vector<float> audio_embed_host_;  // the last frame's codebook-sum (the text hidden size)
+  bool audio_embed_valid_ = false;      // a frame was sampled and audio_embed_host_ is usable
   bool speech_forced_ = false;  // the speech slots force <|audio_out|> (the audio mode's mask)
 };
 
