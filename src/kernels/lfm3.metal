@@ -408,6 +408,19 @@ struct Lfm3RepPenParams {
   logits[g] = lg > 0.0f ? lg / p.penalty : lg * p.penalty;
 }
 
+// the TTS text mode: ban the audio tokens' logits so a text-mode request on a TTS model can't
+// drift into speech (the omni model's raw logits otherwise pick <|audio_start|>/<|audio_out|>).
+// One thread, up to 3 token ids; the top-k then can never choose a banned slot.
+struct Lfm3BanAudioParams {
+  int id0, id1, id2, n;
+};
+[[kernel]] void lfm3_ban_audio(device float* logits [[buffer(0)]],
+                                constant Lfm3BanAudioParams& p [[buffer(1)]]) {
+  if (p.id0 >= 0) logits[p.id0] = -1e30f;
+  if (p.n > 1 && p.id1 >= 0) logits[p.id1] = -1e30f;
+  if (p.n > 2 && p.id2 >= 0) logits[p.id2] = -1e30f;
+}
+
 // the TTS speech mode's forced token: the audio-out slots sample no text — the depth decoder's
 // codes ride the hidden state and the sequence carries <|audio_out|> (the reference's audio mode)
 [[kernel]] void lfm3_write_token(device int* tok [[buffer(0)]], constant int& value [[buffer(1)]],

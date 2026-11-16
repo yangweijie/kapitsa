@@ -236,6 +236,11 @@ struct Lfm3RepPenParams {
   uint32_t base, n;
   float penalty;
 };
+// The TTS text mode (lfm3_ban_audio): force the audio tokens' logits to -1e30 so a text-mode
+// request on a TTS model can't drift into speech. Mirrored in lfm3.metal.
+struct Lfm3BanAudioParams {
+  int id0, id1, id2, n;
+};
 
 Lfm3::Lfm3(const std::string& path, int prefill_chunk) : path_(path) {
   cfg_ = read_config(path);
@@ -245,9 +250,11 @@ Lfm3::Lfm3(const std::string& path, int prefill_chunk) : path_(path) {
     const nlohmann::json gc = nlohmann::json::parse(std::ifstream(path + "/audio_gen_config.json"), nullptr, false);
     if (!gc.is_discarded()) {
       audio_out_token_ = gc.value("audio_out_token_id", -1);
+      audio_start_id_ = gc.value("audio_start_token_id", -1);
       audio_eos_code_ = gc.value("audio_eos_code", -1);
       audio_temperature_ = gc.value("audio_temperature", 0.0f);
-      logi("tts: the speech side is present (audio_out token %d, eos code %d)", audio_out_token_, audio_eos_code_);
+      logi("tts: the speech side is present (audio_out token %d, start token %d, eos code %d)", audio_out_token_,
+           audio_start_id_, audio_eos_code_);
     }
   }
   if (cfg_.bits != 16 && !((cfg_.gs == 64 && (cfg_.bits == 3 || cfg_.bits == 5 || cfg_.bits == 6 || cfg_.bits == 8)) ||
@@ -464,6 +471,9 @@ int Lfm3::audio_eos_code() const {
 
 void Lfm3::set_speech_mode(bool on) {
   speech_forced_ = on;
+  text_only_ = !on;  // a text-mode request on a TTS model bans the audio tokens so it can't drift into speech
+  if (getenv("LFM3_TTS_DBG")) logi("LFM3_TTS_DBG set_speech_mode(on=%d) -> text_only_=%d speech_forced_=%d", on,
+                                   (int)text_only_, (int)speech_forced_);
   if (on) rep_hist_.clear();  // a fresh speech reply: the repetition penalty's window starts empty
   if (on) audio_embed_valid_ = false;  // no previous frame yet: the first audio_out position uses the plain embed
   if (on && !tts_) load_tts();  // the first speech slot's forcing needs the weights in place
@@ -755,6 +765,18 @@ void Lfm3::enc_sample(Encoder& e, Seq& s, const Buffer& xrow, int out_index, con
   to_half(e, xrow, nullptr, xh_, 1);
   lin(e, embed_, xh_, logits_, 1, false, 0);  // the tied head
   enc_logit_mask(e, s, logits_, 1, cfg_.vocab, cfg_.vocab);
+  if (text_only_ && audio_out_token_ >= 0) {
+    // a text-mode request on a TTS model: ban the audio tokens so the reply stays text
+    static Pipeline banp = Gpu::get().pipeline("lfm3_ban_audio");
+    const Lfm3BanAudioParams ba{audio_out_token_, audio_start_id_, -1, 2};
+    e.use(banp);
+    e.buf(0, logits_);
+    e.val(1, ba);
+    e.dispatch(1, 1, 1, 1);
+    if (getenv("LFM3_TTS_DBG")) logi("LFM3_TTS_DBG ban_audio step=%u ids=(%d,%d)", step, audio_out_token_, audio_start_id_);
+  } else if (getenv("LFM3_TTS_DBG")) {
+    logi("LFM3_TTS_DBG no-ban step=%u text_only_=%d audio_out_token_=%d", step, (int)text_only_, audio_out_token_);
+  }
   // The request's repetition penalty (Splash's name, honoured here): scatter the HF penalty onto every context
   // token's logit [0, out_index) of s.tok, before the top-k. Skipped when it is 1.0, so the default pipeline and
   // its outputs stay bit-exact; a > 1.0 opt-in breaks degenerate repeats (a token that recurs is hit again).

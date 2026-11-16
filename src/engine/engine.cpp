@@ -4309,8 +4309,10 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       if (next) next->wait();
     };
     // the Omni's TTS: the audio_reply elicitation (or the model's own <|audio_start|>) forces the
-    // speech slots to <|audio_out|>; the frames' codes are sampled in the token handler
-    if (r.template_kwargs.value("audio_reply", false) && model_->has_tts()) model_->set_speech_mode(true);
+    // Reset the shared model's speech flag to THIS request's mode: speech_forced_ lives on the
+    // model object, so a text request must clear a prior TTS request's latch or it keeps forcing
+    // <|audio_out|>. audio_reply=true (or the model's own ஜீ mid-reply) enables speech.
+    if (model_->has_tts()) model_->set_speech_mode(r.template_kwargs.value("audio_reply", false));
     if (r.max_tokens > 1) next = encode_at(pos);
     while (true) {
       bool go = handle(s.tokens()[pos]);  // available: produced by the previous command buffer
@@ -4902,7 +4904,9 @@ void Engine::remember_reply(const ChatRequest& r, const ChatResult& res) {
   if (!answered_.empty() && answered_.back()->slot == res.slot && answered_.back()->slot_gen == res.slot_gen) return;
   auto a = std::make_shared<Answered>();
   a->r = r;
-  a->r.messages = vision::without_image_data(r.messages, vision_->encoder().image_part());  // (renders the same)
+  // vision_ is set only for models whose encoder carries the image marks; a TTS-only omni model
+  // has none, so guard it (an unconditional deref here SEGV'd on every remembered stop-reply).
+  a->r.messages = vision::without_image_data(r.messages, vision_ ? vision_->encoder().image_part() : ojson());
   a->r.live = nullptr;
   a->r.grammar = nullptr;
   a->content = res.content;

@@ -165,7 +165,8 @@ class Lfm3 : public Model {
   // the speech side, loaded lazily on the first audio-out frame (the weights are the side file)
   std::unique_ptr<tts::DepthDecoder> tts_;
   std::unique_ptr<tts::CodecDecoder> codec_;
-  int audio_out_token_ = -1, audio_eos_code_ = -1;
+  int audio_out_token_ = -1, audio_start_id_ = -1, audio_eos_code_ = -1;
+  bool text_only_ = false;  // this request bans the audio tokens (text mode on a TTS model)
   float audio_temperature_ = 0.0f;
   float audio_rep_penalty_ = 1.0f;  // the reference's n_penalty (the audio repetition penalty; 1.0 = none)
   int audio_rep_window_ = 0;         // its n_window (the last n frames' codes per codebook)
