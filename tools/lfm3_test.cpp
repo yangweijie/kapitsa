@@ -275,6 +275,23 @@ int main() {
   ok("engine: a non-LFM3 keeps the generic refusal",
      ni::unsupported_model(bpath).find("an architecture Kapitsa does not run") != std::string::npos);
 
+  // the TTS sampling fallback: a bare audio_gen_config.json takes the model's generation_config.json
+  const std::string tpath = base + "/tts-fallback";
+  std::filesystem::create_directories(tpath);
+  write_text(tpath + "/generation_config.json", R"({"audio_temperature": 0.4, "audio_top_k": null,
+    "audio_repetition_penalty": 1.2, "audio_repetition_window": 64, "do_sample": false})");
+  float ft = 0.0f, fp = 1.0f;
+  int fw = 0;
+  ni::Lfm3::audio_sampling_fill(tpath, false, false, false, ft, fp, fw);
+  ok("tts: a bare audio_gen takes the model's generation_config sampling defaults",
+     ft == 0.4f && fp == 1.2f && fw == 64, json{{"t", ft}, {"p", fp}, {"w", fw}}.dump());
+  ft = 0.0f; fp = 1.0f; fw = 0;
+  ni::Lfm3::audio_sampling_fill(tpath, true, true, true, ft, fp, fw);  // all keys present: no fill
+  ok("tts: explicit audio_gen keys beat the model's generation_config", ft == 0.0f && fp == 1.0f && fw == 0);
+  ni::Lfm3::audio_sampling_fill(base + "/no-such-model", false, false, false, ft, fp, fw);
+  ok("tts: a model dir without a generation_config.json keeps the defaults",
+     ft == 0.0f && fp == 1.0f && fw == 0);
+
   printf("%s (%d checks, %d failed)\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
   return g_fail ? 1 : 0;
 }

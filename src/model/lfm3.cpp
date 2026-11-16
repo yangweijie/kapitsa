@@ -479,6 +479,21 @@ void Lfm3::set_speech_mode(bool on) {
   if (on && !tts_) load_tts();  // the first speech slot's forcing needs the weights in place
 }
 
+void Lfm3::audio_sampling_fill(const std::string& model_path, bool temp_set, bool pen_set, bool win_set,
+                               float& temperature, float& rep_penalty, int& rep_window) {
+  // The reference's TTS defaults (the generate call's audio_temperature / audio_repetition_penalty /
+  // audio_repetition_window) live in the model's generation_config.json. A hand-built
+  // audio_gen_config.json can lack them, and the engine's defaults then apply (greedy, no penalty):
+  // no EOS code is ever emitted and a TTS reply runs to the length cap. Fill the missing keys from
+  // the model's own values.
+  const nlohmann::json gg = nlohmann::json::parse(std::ifstream(model_path + "/generation_config.json"), nullptr,
+                                                   false);
+  if (gg.is_discarded()) return;
+  if (!temp_set) temperature = gg.value("audio_temperature", temperature);
+  if (!pen_set) rep_penalty = gg.value("audio_repetition_penalty", rep_penalty);
+  if (!win_set) rep_window = gg.value("audio_repetition_window", rep_window);
+}
+
 void Lfm3::load_tts() {
   if (tts_) return;
   const std::string gen = path_ + "/audio-gen.safetensors";
@@ -491,6 +506,9 @@ void Lfm3::load_tts() {
   audio_temperature_ = gc.value("audio_temperature", 0.0f);
   audio_rep_penalty_ = gc.value("audio_repetition_penalty", 1.0f);  // the reference's n_penalty; 1.0 = none
   audio_rep_window_ = gc.value("audio_repetition_window", 0);       // its n_window
+  audio_sampling_fill(path_, gc.contains("audio_temperature"), gc.contains("audio_repetition_penalty"),
+                      gc.contains("audio_repetition_window"), audio_temperature_, audio_rep_penalty_,
+                      audio_rep_window_);  // the model's generation_config.json covers what it lacks
   tts_ = std::make_unique<tts::DepthDecoder>(gen);
   logi("tts: the depth decoder loaded (%d codebooks, audio_out token %d)", gc.value("num_codebooks", 12),
        audio_out_token_);

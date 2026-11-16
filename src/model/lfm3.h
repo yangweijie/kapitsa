@@ -87,6 +87,11 @@ class Lfm3 : public Model {
   static constexpr int kMaxRows = 8;  // rows of a decode / verify pass
 
   static bool is_model(const std::string& dir);  // config.json's model_type names the LFM3 family
+  // The TTS sampling keys (temperature / repetition penalty / window) that a hand-built
+  // audio_gen_config.json leaves out, from the model's own generation_config.json (the reference's
+  // generate defaults). A false *_set leaves that value as-is, so an explicit audio_gen key wins.
+  static void audio_sampling_fill(const std::string& model_path, bool temp_set, bool pen_set, bool win_set,
+                                  float& temperature, float& rep_penalty, int& rep_window);
   static Lfm3Config read_config(const std::string& dir);
   static MemPlan plan(const std::string& path, int prefill_chunk = 2048);
   // Cache bytes: full-attention layers per position; sliding-window layers a ring of window + 8 positions per
