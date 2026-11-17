@@ -849,6 +849,11 @@ void Lfm3::encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, ui
     // the reference's get_audio_out_embeds: this audio_out position's input is the previous
     // frame's codebook-sum embedding (x_'s row 0), not the fixed <|audio_out|> embed row.
     memcpy(x_.ptr(), audio_embed_host_.data(), size_t(cfg_.hidden) * 4);
+  } else if (speech_forced_ && pos > 0 && s.tok.as<int>()[pos - 1] == audio_start_id_) {
+    // the reference's first speech position feeds the <|audio_start|> embedding — the token the
+    // model itself emitted before the frame (generate's next_embeds = embed_tokens(audio_start)),
+    // not a plain <|audio_out|> row; the prefill ends on <|audio_start|>, so read pos - 1's row.
+    embed(e, s.tok, pos - 1, 1, x_);
   } else {
     embed(e, s.tok, pos, 1, x_);
   }
