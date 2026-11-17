@@ -267,16 +267,14 @@ std::vector<int> DepthDecoder::sample_frame(const std::vector<float>& hidden, fl
   for (int i = 0; i < kCodebooks; ++i) order[size_t(i)] = i;
   std::mt19937 rng(seed);
   std::shuffle(order.begin(), order.end(), rng);
-  return sample_frame(hidden, temperature, order, rep_hist, rep_penalty);
+  return sample_frame(hidden, temperature, order, seed, rep_hist, rep_penalty);
 }
 
 std::vector<int> DepthDecoder::sample_frame(const std::vector<float>& hidden, float temperature,
-                                            const std::vector<int>& order,
+                                            const std::vector<int>& order, uint64_t seed,
                                             const std::vector<std::vector<int>>& rep_hist,
                                             float rep_penalty) const {
   static const int kSchedule[] = {4, 4, 4};  // the reference's config.maskgit_schedule
-  std::mt19937 rng(0);  // only used when the caller passes a temperature: a fixed stream for the
-                        // fixed order (the seeded variant owns its shuffle stream)
   std::vector<int> codes(kCodebooks, 0);
   std::vector<uint8_t> revealed(kCodebooks, 0);
   std::vector<float> logits;
@@ -302,11 +300,13 @@ std::vector<int> DepthDecoder::sample_frame(const std::vector<float>& hidden, fl
         const float* lg = logits.data() + size_t(c) * kCodebookSize;
         for (int k = 0; k < kCodebookSize; ++k) mx = std::max(mx, double(lg[k] / temperature));
         for (int k = 0; k < kCodebookSize; ++k) sum += p[size_t(k)] = std::exp(double(lg[k] / temperature) - mx);
-        std::uniform_real_distribution<double> uni(0.0, sum);
-        double draw = uni(rng), run = 0;
+        // the codebook's own uniform (the reference's multinomial is a fresh draw per selection;
+        // draw keys it to (seed, c), so the request's seed makes the reply's draws reproducible)
+        const double u = draw(seed, c);
+        double run = 0;
         for (int k = 0; k < kCodebookSize; ++k) {
           run += p[size_t(k)];
-          if (run >= draw) {
+          if (run >= u * sum) {
             codes[size_t(c)] = k;
             break;
           }
@@ -349,15 +349,17 @@ void DepthDecoder::apply_repetition_penalty(std::vector<float>& logits,
   }
 }
 
-// the CPU sampler's fixed stream: every temperature selection is a fresh mt19937(0) + ONE
-// uniform_real draw in [0, sum), and that one draw is frac * sum (libc++'s uniform_real is a
-// single 32-bit stream value, probed bit-exact) — the GPU's reveal reproduces the CPU's code
-// selection with this host constant.
-static const double kDrawFrac = [] {
-  std::mt19937 r(0);
-  std::uniform_real_distribution<double> u(0.0, 1.0);
-  return u(r);
-}();
+// The temperature draw of codebook c under a request seed: the reference's torch.multinomial takes
+// a fresh uniform per selection, so each (seed, c) pair gets its own — splitmix64 over
+// (seed, c), in [0, 1). The GPU reveal's fp32 walk and the CPU oracle's double walk use the same
+// value (the GPU binds it as a float, the host's double here is the wider form).
+double DepthDecoder::draw(uint64_t seed, int c) {
+  uint64_t z = seed ^ 0x9E3779B97F4A7C15ULL * (uint64_t(c) + 1) ^ 0x85EBCA6B2E5E9ECFULL;
+  z = (z ^ (z >> 31)) * 0x2545F4914F6CDD1DULL;
+  z = (z ^ (z >> 29)) * 0x59E5B5F2E0C3B9B5ULL;
+  z ^= z >> 32;
+  return double(z >> 11) / double(1ULL << 53);
+}
 
 // ---- the GPU path (src/kernels/tts.metal; the CPU forward above is the oracle) ----
 
@@ -458,11 +460,11 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
   for (int i = 0; i < kCodebooks; ++i) order[size_t(i)] = i;
   std::mt19937 shuf(seed);
   std::shuffle(order.begin(), order.end(), shuf);
-  return sample_frame_gpu(hidden, temperature, order, rep_hist, rep_penalty);
+  return sample_frame_gpu(hidden, temperature, order, seed, rep_hist, rep_penalty);
 }
 
 std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden, float temperature,
-                                                const std::vector<int>& order,
+                                                const std::vector<int>& order, uint64_t seed,
                                                 const std::vector<std::vector<int>>& rep_hist,
                                                 float rep_penalty) {
   if (!gpu_ready_) load_gpu();
@@ -558,8 +560,12 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
     e->buf(1, cbuf);
     e->buf(2, rbuf);
     e->bytes(3, sel.data(), 12);
-    e->val(4, temperature <= 0.0f ? 0u : 1u);  // 0 = the greedy argmax, 1 = the fixed-stream draw
-    e->val(5, float(kDrawFrac));  // the MSL walk is fp32 (MSL has no double)
+    e->val(4, temperature <= 0.0f ? 0u : 1u);  // 0 = the greedy argmax, 1 = the temperature draw
+    {  // the codebook's own uniform each (draw, above): the MSL walk is fp32 (MSL has no double)
+      float dr[kCodebooks];
+      for (int i = 0; i < kCodebooks; ++i) dr[i] = float(draw(seed, i));
+      e->bytes(5, dr, sizeof dr);
+    }
     e->val(6, temperature);
     e->dispatch(kCodebooks, 1, 1, 1);
   };
@@ -642,7 +648,7 @@ std::vector<int> DepthDecoder::sample_frame_gpu(const std::vector<float>& hidden
   // the engine's command queue (the containment's CPU fallback is the proven-matching oracle)
   e->commit();
   const double readout_ms = getenv("NI_TTS_READOUT_MS") ? std::atof(getenv("NI_TTS_READOUT_MS")) : 2000.0;
-  if (!e->wait_for(readout_ms)) return sample_frame(hidden, temperature, order, rep_hist, rep_penalty);
+  if (!e->wait_for(readout_ms)) return sample_frame(hidden, temperature, order, seed, rep_hist, rep_penalty);
   memcpy(codes.data(), cbuf.ptr(), size_t(kCodebooks) * sizeof(int));
   return codes;
 }

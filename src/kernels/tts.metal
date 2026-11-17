@@ -334,20 +334,20 @@ using namespace metal;
 
 // the pass's reveal: for each codebook the host marked selected this pass (the MaskGIT schedule
 // slice), pick its code from the (penalized) logits — the greedy argmax (mode 0, the CPU's
-// first-max walk, bit-exact in fp32) or the CPU sampler's fixed-stream temperature draw
-// (mode 1: the host's frac is the CPU's one uniform_real draw of a fresh mt19937(0); the mx is
-// the fp32 max of the fp32 quotients — the CPU's double mx over the same quotients, exact — and
-// the exp/sum/walk run in fp32 against the CPU's double: a selection can flip only when two
-// cumulative sums sandwich the draw within that ~1e-7 drift, and the path stays deterministic
-// run to run). The code + the revealed flag land in the GPU state the NEXT pass's
-// tts_fill_adds reads; the frame's codes are the single readout. grid = 12 groups of one
-// thread. MSL has no double, so the walk is fp32 throughout.
+// first-max walk, bit-exact in fp32) or the per-codebook temperature draw (mode 1: the host's
+// draws[c] is codebook c's uniform, splitmix64 over (seed, c) — the reference's torch.multinomial
+// is a fresh uniform per selection, so the mx is the fp32 max of the fp32 quotients and the
+// exp/sum/walk run in fp32 against the CPU's double walk of the same draw: a selection can flip
+// only when two cumulative sums sandwich it within that ~1e-7 drift, and the path stays
+// deterministic run to run for a request seed). The code + the revealed flag land in the GPU
+// state the NEXT pass's tts_fill_adds reads; the frame's codes are the single readout. grid = 12
+// groups of one thread. MSL has no double, so the walk is fp32 throughout.
 [[kernel]] void tts_reveal(const device float* lg [[buffer(0)]],  // [12, 2017] the pass's penalized logits
                           device int* codes [[buffer(1)]],      // [12]
                           device uchar* revealed [[buffer(2)]],  // [12]
                           const device uchar* sel [[buffer(3)]], // [12] this pass's selected codebooks
                           constant uint& mode [[buffer(4)]],     // 0 = the greedy argmax, 1 = the temperature draw
-                          constant float& frac [[buffer(5)]],
+                          const device float* draws [[buffer(5)]], // [12] each codebook's uniform, in [0, 1)
                           constant float& temp [[buffer(6)]],
                           uint c [[threadgroup_position_in_grid]]) {
   if (c >= 12u || !sel[c]) return;
@@ -366,7 +366,7 @@ using namespace metal;
     }
     float sum = 0;
     for (int k = 0; k < 2017; ++k) sum += metal::exp(row[k] / temp - mx);
-    const float draw = frac * sum;
+    const float draw = draws[c] * sum;
     float run = 0;
     int best = 2016;
     for (int k = 0; k < 2017; ++k) {

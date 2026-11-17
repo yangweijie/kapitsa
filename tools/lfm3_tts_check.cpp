@@ -109,11 +109,31 @@ int main(int argc, char** argv) {
     ok("the MaskGIT sampler: deterministic for a seed, the codes in range", det && ranged);
     std::vector<int> fixed(12);
     for (int i = 0; i < 12; ++i) fixed[size_t(i)] = i;
-    const std::vector<int> framed = dec.sample_frame(hidden, 0.0f, fixed);
+    const std::vector<int> framed = dec.sample_frame(hidden, 0.0f, fixed, 1);
     bool first_pass = true;
     for (int c = 0; c < 4; ++c) first_pass = first_pass && framed[size_t(c)] == argmax[size_t(c)];
     ok("the MaskGIT sampler: the first pass's codes (fixed order) are the all-masked argmax",
        first_pass && framed.size() == 12);
+    // the temperature draws are per-(seed, codebook) streams (the reference's multinomial takes a
+    // fresh uniform per selection): reproducible, in [0, 1), distinct per codebook, uniform-ish
+    // over a seed range (the fixed-quantile era's draw was 0.5928 for every selection)
+    {
+      double dmin = 1.0, dmax = 0.0, acc = 0;
+      for (int s = 0; s < 32; ++s)
+        for (int c = 0; c < 12; ++c) {
+          const double d = ni::tts::DepthDecoder::draw(uint64_t(s), c);
+          if (d < dmin) dmin = d;
+          if (d > dmax) dmax = d;
+          acc += d;
+        }
+      const double mean = acc / (32 * 12);
+      const bool draw_ok = dmin >= 0.0 && dmax < 1.0 &&
+                           ni::tts::DepthDecoder::draw(1, 1) == ni::tts::DepthDecoder::draw(1, 1) &&
+                           ni::tts::DepthDecoder::draw(1, 1) != ni::tts::DepthDecoder::draw(1, 2) &&
+                           std::abs(mean - 0.5) <= 0.1;
+      ok("the temperature draw: per-(seed, codebook), reproducible, uniform-ish over [0, 1)",
+         draw_ok, "mean " + std::to_string(mean) + " over 384 draws");
+    }
   }
   {
     // the GPU path vs the CPU oracle (the same frame, the same fixed reveal order)
@@ -123,9 +143,9 @@ int main(int argc, char** argv) {
     const std::vector<float> hidden = rec0["hidden"].get<std::vector<float>>();
     std::vector<int> fixed(12);
     for (int i = 0; i < 12; ++i) fixed[size_t(i)] = i;
-    const std::vector<int> cpu = dec.sample_frame(hidden, 0.0f, fixed);
-    const std::vector<int> gpu = gdec.sample_frame_gpu(hidden, 0.0f, fixed);
-    const std::vector<int> gpu2 = gdec.sample_frame_gpu(hidden, 0.0f, fixed);
+    const std::vector<int> cpu = dec.sample_frame(hidden, 0.0f, fixed, 1);
+    const std::vector<int> gpu = gdec.sample_frame_gpu(hidden, 0.0f, fixed, 1);
+    const std::vector<int> gpu2 = gdec.sample_frame_gpu(hidden, 0.0f, fixed, 1);
     int same = 0;
     for (int c = 0; c < 12; ++c) same += cpu[size_t(c)] == gpu[size_t(c)];
     if (getenv("NI_TTS_DEBUG"))
@@ -141,7 +161,7 @@ int main(int argc, char** argv) {
       double tms[64];
       for (int i = 0; i < n && i < 64; ++i) {
         auto a = std::chrono::steady_clock::now();
-        const std::vector<int> fr = gdec.sample_frame_gpu(hid, 0.0f, fixed);
+        const std::vector<int> fr = gdec.sample_frame_gpu(hid, 0.0f, fixed, 1);
         auto b = std::chrono::steady_clock::now();
         tms[i] = std::chrono::duration<double>(b - a).count() * 1000;
         (void)fr;
@@ -152,31 +172,31 @@ int main(int argc, char** argv) {
       fprintf(stderr, "tts time: median %.1f ms/frame over %d frames (the single-readout path)\n",
               sorted[n / 2], n);
     }
-    // the temperature draw: the CPU sampler's FIXED stream (a fresh mt19937(0) per selection,
-    // one uniform_real draw) vs the GPU reveal's fp32 walk — the codes must agree (the ~1e-7
-    // exp/sum drift only flips a selection when two cumulative sums sandwich the draw in it)
-    const std::vector<int> cpu_t = dec.sample_frame(hidden, 0.4f, fixed);
-    const std::vector<int> gpu_t = gdec.sample_frame_gpu(hidden, 0.4f, fixed);
+    // the temperature draw: both paths walk the SAME per-codebook uniform (draw(seed, c) — the
+    // reference's multinomial is a fresh uniform per selection; splitmix64 over (seed, c)). The
+    // codes must agree: the only drift is the trunk's fp32 logit noise (~3e-5) inverting a
+    // near-tie, plus the GPU's fp32 exp/sum walk against the CPU's double.
+    const std::vector<int> cpu_t = dec.sample_frame(hidden, 0.4f, fixed, 1);
+    const std::vector<int> gpu_t = gdec.sample_frame_gpu(hidden, 0.4f, fixed, 1);
     int t_same = 0;
     for (int c = 0; c < 12; ++c) t_same += cpu_t[size_t(c)] == gpu_t[size_t(c)];
     // The GPU's trunk is fp32 (the CPU oracle's, its ~3e-5 logit drift), and the fp32 walk's
     // mass noise is ~1e-6: a temperature SELECTION can flip only between near-tie codes (the
     // flip's probability is ~the noise, so the codes agree except where the trunk's fp32 noise
-    // inverts a near-tie). The gate is the determinism + the agreement floor (measured 7/12 on
-    // this oracle frame; the 5 flips are the near-ties, every flipped code is a top-2 code).
+    // inverts a near-tie). The gate is the determinism + the agreement floor.
     if (getenv("NI_TTS_DEBUG"))
       for (int c = 0; c < 12; ++c)
         fprintf(stderr, "dbg t: cb%d cpu %d gpu %d\n", c, cpu_t[c], gpu_t[c]);
-    ok("the depth decoder's GPU temperature draw: deterministic, the codes within the near-tie band of the CPU's fixed stream",
+    ok("the depth decoder's GPU temperature draw: deterministic, the codes within the near-tie band of the CPU's walk",
        t_same >= 7, "match " + std::to_string(t_same) + " of 12 codebooks");
     // the GPU's repetition penalty vs the CPU's (a strong penalty on the just-emitted codes):
     // the penalized frame's codes must agree between the two paths
-    const std::vector<int> no_pen = dec.sample_frame(hidden, 0.0f, fixed);
+    const std::vector<int> no_pen = dec.sample_frame(hidden, 0.0f, fixed, 1);
     std::vector<std::vector<int>> rep(ni::tts::DepthDecoder::kCodebooks);
     for (int c = 0; c < ni::tts::DepthDecoder::kCodebooks; ++c) rep[size_t(c)].push_back(no_pen[size_t(c)]);
-    const std::vector<int> cpu_pen = dec.sample_frame(hidden, 0.0f, fixed, rep, 1e6f);
-    const std::vector<int> gpu_pen = gdec.sample_frame_gpu(hidden, 0.0f, fixed, rep, 1e6f);
-    const std::vector<int> gpu_nopen = gdec.sample_frame_gpu(hidden, 0.0f, fixed);
+    const std::vector<int> cpu_pen = dec.sample_frame(hidden, 0.0f, fixed, 1, rep, 1e6f);
+    const std::vector<int> gpu_pen = gdec.sample_frame_gpu(hidden, 0.0f, fixed, 1, rep, 1e6f);
+    const std::vector<int> gpu_nopen = gdec.sample_frame_gpu(hidden, 0.0f, fixed, 1);
     int pen_same = 0;
     for (int c = 0; c < ni::tts::DepthDecoder::kCodebooks; ++c)
       pen_same += cpu_pen[size_t(c)] == gpu_pen[size_t(c)];
@@ -205,9 +225,9 @@ int main(int argc, char** argv) {
       const float P = 1.2f;  // a mild, config-realistic n_penalty (the reference's default is 1.0 = off)
       int faithful = 0, noop = 0, effect = 0;
       for (int r = 0; r < 5; ++r) {
-        const std::vector<int> gp = gdec.sample_frame_gpu(hidden, 0.0f, fixed, w, P);
-        const std::vector<int> gn = gdec.sample_frame_gpu(hidden, 0.0f, fixed, w, 1.0f);
-        const std::vector<int> cp = dec.sample_frame(hidden, 0.0f, fixed, w, P);
+        const std::vector<int> gp = gdec.sample_frame_gpu(hidden, 0.0f, fixed, 1, w, P);
+        const std::vector<int> gn = gdec.sample_frame_gpu(hidden, 0.0f, fixed, 1, w, 1.0f);
+        const std::vector<int> cp = dec.sample_frame(hidden, 0.0f, fixed, 1, w, P);
         int band = 0, no = 0, mv = 0;
         for (int c = 0; c < 12; ++c) {
           band += gp[c] == cp[c];
@@ -315,10 +335,10 @@ int main(int argc, char** argv) {
     const std::vector<float> hid0 = rec0["hidden"].get<std::vector<float>>();
     std::vector<int> fixed(12);
     for (int i = 0; i < 12; ++i) fixed[size_t(i)] = i;
-    const std::vector<int> no_pen = dec.sample_frame(hid0, 0.0f, fixed);  // defaults: no history/penalty
+    const std::vector<int> no_pen = dec.sample_frame(hid0, 0.0f, fixed, 1);  // defaults: no history/penalty
     std::vector<std::vector<int>> rep(ni::tts::DepthDecoder::kCodebooks);
     for (int c = 0; c < ni::tts::DepthDecoder::kCodebooks; ++c) rep[size_t(c)].push_back(no_pen[size_t(c)]);
-    const std::vector<int> penal = dec.sample_frame(hid0, 0.0f, fixed, rep, 1e6f);  // a strong penalty on the repeats
+    const std::vector<int> penal = dec.sample_frame(hid0, 0.0f, fixed, 1, rep, 1e6f);  // a strong penalty on the repeats
     int diffs = 0;
     for (int c = 0; c < ni::tts::DepthDecoder::kCodebooks; ++c) diffs += no_pen[size_t(c)] != penal[size_t(c)];
     ok("the audio repetition penalty is effective: a strong penalty on the just-emitted codes moves the frame",

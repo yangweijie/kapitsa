@@ -41,9 +41,10 @@ class DepthDecoder {
                                 const std::vector<std::vector<int>>& rep_hist = {},
                                 float rep_penalty = 1.0f) const;
   // The same with a fixed reveal order (the checks' form: with order {0..11} the first pass's codes
-  // are exactly the all-masked argmax of codebooks 0-3).
+  // are exactly the all-masked argmax of codebooks 0-3). seed keys the per-codebook temperature
+  // draws (draw), so a request seed makes the reply's draws reproducible.
   std::vector<int> sample_frame(const std::vector<float>& hidden, float temperature,
-                                const std::vector<int>& order,
+                                const std::vector<int>& order, uint64_t seed,
                                 const std::vector<std::vector<int>>& rep_hist = {},
                                 float rep_penalty = 1.0f) const;
   // The GPU form (Metal kernels, src/kernels/tts.metal; the CPU forward stays the oracle). The
@@ -57,11 +58,15 @@ class DepthDecoder {
   // row i*codebook_size + codes[i]). Empty when the checkpoint has no codebook_embedding table.
   const std::vector<float>& codebook_sum(const std::vector<int>& codes) const;
   bool has_codebook() const { return !codebook_emb_.empty(); }
+  // The temperature draw of codebook c under a request seed: the reference's torch.multinomial is a
+  // fresh uniform per selection, so each (seed, c) pair has its own uniform — splitmix64 over
+  // (seed, c), in [0, 1). The GPU reveal and the CPU oracle walk the same draw.
+  static double draw(uint64_t seed, int c);
   std::vector<int> sample_frame_gpu(const std::vector<float>& hidden, float temperature, uint64_t seed,
                                    const std::vector<std::vector<int>>& rep_hist = {},
                                    float rep_penalty = 1.0f);
   std::vector<int> sample_frame_gpu(const std::vector<float>& hidden, float temperature,
-                                    const std::vector<int>& order,
+                                    const std::vector<int>& order, uint64_t seed,
                                     const std::vector<std::vector<int>>& rep_hist = {},
                                     float rep_penalty = 1.0f);
 
